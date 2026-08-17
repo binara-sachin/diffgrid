@@ -106,3 +106,22 @@ to solve against, not speculatively.
 
 **How to apply**: if a real file large enough to make `std::fs::read` itself a bottleneck shows
 up (measured, not assumed), that's the trigger to revisit this — not before.
+
+## 2026-08-17 — Intra-line diff uses prefix/suffix trimming, not full LCS/Myers
+
+**Decision**: `diff_core::intra_line_spans` finds the common prefix and suffix between two lines
+and marks everything in between as changed on each side, rather than running a full
+LCS/Myers-style minimal-edit-script algorithm.
+
+**Why**: a DP-based LCS diff is O(n·m) in line length, which is fine for typical lines but has no
+upper bound on a pathologically long single line — exactly the kind of eager, unbounded cost this
+project's fps-priority mandate has already spent a full investigation getting rid of elsewhere
+(see `docs/PROFILING.md`). Prefix/suffix trimming is O(n), can't blow up regardless of input, and
+is a well-established "good enough" technique for intra-line highlighting in practice.
+
+**How to apply**: this will occasionally produce a larger "changed" span than a human would pick
+when a line has two separate edits far apart (e.g. two single-character changes at opposite ends
+of a long line get merged into one span covering everything between them). Don't fix this
+speculatively — revisit only if it visibly produces unhelpfully large spans on real content, and
+prefer a bounded approach (e.g. LCS only below a length cap, falling back to trimming above it)
+over an unconditional full LCS if it does.
