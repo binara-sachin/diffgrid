@@ -125,3 +125,32 @@ Next step, in order:
 2. Regardless of platform, treat §3's finding as a fixed input to M1's diff-pane design: the
    current padding-widget approach does not scale to 100k-line files and needs to be replaced
    before, not after, M1 is built on top of it.
+
+## 5. Idle memory re-checked against the 10k fixture (2026-08-17)
+
+§2's "passes comfortably at 178MB" claim was measured on the 100k-line fixture and, per the
+correction in §2 and `docs/PROFILING.md`, is not reproducible — a later run of the identical
+100k-line config measured ~995MB with lower ambient system memory pressure. That left open
+whether idle memory scales with document size (in which case the actual PLAN.md target — 300MB
+for a **10k-line** comparison, not 100k — might still hold even though the 100k number is bad) or
+whether it's a largely fixed WebKitGTK baseline cost. This was checked directly by pointing the
+app at `fixtures/10k-line-pair` (`FIXTURE` in `src/routes/+page.svelte`, temporarily edited for
+this measurement then reverted) and re-running the harness, 3 runs, ~10.9GiB free of 11.8GiB total:
+
+| metric | mean | p50 | max |
+|---|---|---|---|
+| idle memory (host + descendant processes, summed RSS) | 686.9MB | 686.8MB | 687.3MB |
+| steady-state scroll fps | 55.7 | 55.6 | — |
+| in-app open-to-first-paint | 378.7ms | 375.0ms | 387.0ms |
+
+**The 300MB idle-memory target does not hold, even on the fixture size the target was actually
+written for.** 687MB on 10k lines vs. 177-995MB observed on 100k lines across two prior runs
+indicates idle memory is dominated by a largely-fixed WebKitGTK/Xvfb/Tauri process-tree baseline,
+not primarily by document size — consistent with §3's finding that fps (not memory) is what
+scales with widget/hunk count. Combined with the memory-pressure sensitivity already documented,
+this means: **no idle-memory reading taken in this sandbox to date should be read as "passing" or
+"failing" the 300MB criterion with confidence** — three different numbers (178MB, 995MB, 687MB)
+have now been measured across two fixture sizes and two ambient-memory conditions, and the
+spread is wide enough that ambient memory pressure plausibly still dominates over fixture size.
+This needs re-measurement on macOS with WKWebView, which may not exhibit the same baseline cost
+or memory-pressure sensitivity at all — see `PLATFORM_NOTES.md`.

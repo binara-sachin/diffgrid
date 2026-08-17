@@ -35,12 +35,17 @@ exercised on Linux in this repo's history. **Verify on macOS**: confirm `cargo b
 -p app --features tauri/custom-protocol` produces a binary that loads correctly (not "Connection
 refused"), the same way it was diagnosed here.
 
-**Idle memory instability** (see `docs/PROFILING.md`'s correction). Measured on Linux/WebKitGTK
-to vary ~5.6x (178MB → 995MB) with ambient system memory pressure alone, no code change.
-**Verify on macOS**: don't assume WKWebView is stable just because it's a different engine —
-check whether the same memory-pressure sensitivity exists there. If it does, any single idle-
-memory number reported without the accompanying `os.freemem()`/`os.totalmem()) line from the
-harness should be treated as meaningless.
+**Idle memory instability, and the 300MB target is unverified** (see `docs/PROFILING.md`'s
+correction and `docs/M0-RESULTS.md` §5). Measured on Linux/WebKitGTK to vary ~5.6x (178MB →
+995MB) on the 100k fixture with ambient system memory pressure alone, no code change; a third
+reading on the smaller 10k fixture (the one the 300MB target was actually written against) came
+in at 687MB — over the threshold, and not obviously explained by fixture size given the spread
+already seen at fixed fixture size. **Verify on macOS**: don't assume WKWebView is stable just
+because it's a different engine — check whether the same memory-pressure sensitivity exists
+there, and re-run the 10k-fixture idle-memory check specifically against the 300MB PLAN.md
+criterion. If WKWebView shows similar instability, any single idle-memory number reported without
+the accompanying `os.freemem()`/`os.totalmem()` line from the harness should be treated as
+meaningless.
 
 ## Sandbox environment setup (not code — won't apply on a real macOS machine)
 
