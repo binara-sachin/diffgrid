@@ -56,8 +56,13 @@ actual M4 Pro before being used to decide anything.
 Against the kill criteria written into `docs/PLAN.md` §8 (>600ms cold launch, <55fps sustained
 scroll, >350MB idle memory → fall back to Option A):
 
-- **Idle memory: passes comfortably** (178MB vs 350MB threshold), and is the criterion least
-  affected by this sandbox's software-rendering gap — real evidence, not just a directional guess.
+- **Idle memory: passes comfortably at 178MB vs 350MB threshold, but this claim needs a
+  correction — see `docs/PROFILING.md` "Correction to M0-RESULTS.md."** A later re-run of the
+  same code with the sandbox otherwise idle (vs. mid-toolchain-install here) measured ~995MB.
+  Idle memory turned out to be *more* environment-sensitive than assessed below, not less — it
+  tracks ambient system memory pressure, which WebKitGTK adapts its caching to. Do not treat
+  either number as "the" idle-memory figure for this app; both are real, under different
+  conditions.
 - **Scroll fps: fails** (23fps vs 55fps threshold) — but see §3, this is not evenly distributed;
   it's a handful of severe periodic stalls (~700-800ms) against an otherwise decent frame rate.
 - **Cold launch: ambiguous.** The raw total (3.4s) blows the threshold, but 2.68s of that is

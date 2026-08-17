@@ -123,6 +123,38 @@ alone would have said otherwise.
 | 1 | `estimatedHeight` override + line-height fix | paint 2684ms, 23.3fps | paint 2839ms, 22.2fps | no measurable win — `estimatedHeight` reverted; line-height correction kept (correctness, not perf) |
 | 2 | scroll-position mapping, no padding widgets | paint 2684ms, 23.3fps | paint 100.6ms, 58.1fps | measurable win, **reverted anyway** — functional regression (loses full-pane alignment), confirmed visually |
 
+## Correction to M0-RESULTS.md: idle memory is not stable, contradicting the earlier claim
+
+While making the benchmark harness cross-platform (replacing `/proc`-based RSS sampling with a
+`ps`-based one that works on macOS too), the harness was re-run against **unchanged code** and
+idle memory measured **~995MB** — a ~5.6x increase from the ~178MB recorded in
+`docs/M0-RESULTS.md`. This is not a measurement bug: `ps`'s `rss` column and `/proc/<pid>/status`'s
+`VmRSS` were checked side-by-side for the same live process and agree exactly (777600kB both
+ways). The actual `WebKitWebProcess` RSS itself changed by that much, with the same binary, the
+same fixture, the same everything except wall-clock time in a long session.
+
+The correlated variable: system-wide free memory. `docs/M0-RESULTS.md`'s measurements were taken
+while this sandbox was mid-toolchain-install (rustup, apt packages, multiple `cargo build`s
+running or having just run) — memory pressure was real. This later re-run happened with the
+system otherwise idle (~11GiB free out of ~12GiB total). WebKitGTK appears to scale its
+cache/heap behavior to ambient system memory pressure, which is unsurprising for a browser
+engine but means **RSS is not a fixed property of this app** in this environment — it reflects
+how much memory WebKit believes it can spend, not how much the app needs.
+
+`docs/M0-RESULTS.md` §4 explicitly claimed idle memory was "the metric least distorted by the
+[Linux/no-GPU/WebKitGTK] gap" and "real evidence, not just directional." **That claim is wrong**
+— idle memory turned out to be *more* environment-sensitive than initially assessed, just to a
+different environmental variable (memory pressure) than the ones originally considered (GPU,
+compositor, WebView engine). The 178MB and 995MB numbers are both real, valid measurements of
+the same code under different ambient memory conditions; neither one alone is "the" idle-memory
+number for this app.
+
+The harness now logs `os.freemem()`/`os.totalmem()` (portable, cross-platform) alongside every
+run specifically so this can't silently happen again unnoticed — any future idle-memory number
+should be reported together with the ambient memory-pressure line, not alone. This needs to be
+checked on macOS too, not assumed away: whether WKWebView has comparable adaptive behavior is
+unverified.
+
 ## Where this leaves M1
 
 The shipped state at the end of this pass is **the original M0 baseline**, unchanged in

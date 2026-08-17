@@ -11,17 +11,20 @@
 //   - scroll fps: parsed from the DIFFGRID_BENCH line the app itself reports.
 //
 // On Linux without a DISPLAY, this script launches its own Xvfb. On macOS a real
-// display is assumed and Xvfb is not touched.
+// display is assumed and Xvfb is not touched — the only platform-conditional branch
+// in this script; everything else (process-tree walking, RSS sampling) uses `ps`
+// uniformly since both GNU ps (Linux) and BSD ps (macOS) support the same
+// `-o pid=,ppid=,rss=` output form. See PLATFORM_NOTES.md.
 //
 // Usage: node bench/m0-spike.mjs [iterations] [--disable-padding]
 //   --disable-padding sets DIFFGRID_DISABLE_PADDING=1 for the app, an A/B toggle to test
 //   whether alignment-padding block widgets are the source of the scroll-onset stall,
 //   rather than asserting that cause without testing it.
 
-import { spawn } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
+import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import os from "node:os";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -36,40 +39,37 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function readIntFromStatus(pid, key) {
-  try {
-    const status = readFileSync(`/proc/${pid}/status`, "utf8");
-    const m = status.match(new RegExp(`^${key}:\\s+(\\d+)\\s+kB`, "m"));
-    return m ? parseInt(m[1], 10) : 0;
-  } catch {
-    return 0; // process may have exited between listing and reading
+// One process-table snapshot per call: {pid: {ppid, rssKb}}. A single `ps -A` covers every
+// process on the system, which is simpler and more portable than walking /proc (Linux-only)
+// or shelling out per-pid.
+function processTable() {
+  const out = execFileSync("ps", ["-A", "-o", "pid=,ppid=,rss="], { encoding: "utf8" });
+  const table = new Map();
+  for (const line of out.trim().split("\n")) {
+    const [pid, ppid, rss] = line.trim().split(/\s+/).map(Number);
+    if (!Number.isNaN(pid)) table.set(pid, { ppid, rssKb: rss });
   }
+  return table;
 }
 
-function children(pid) {
-  try {
-    const raw = readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8").trim();
-    return raw ? raw.split(/\s+/).map(Number) : [];
-  } catch {
-    return [];
-  }
-}
-
-function descendants(pid) {
+function descendants(pid, table) {
   const all = [pid];
   const queue = [pid];
   while (queue.length) {
     const p = queue.shift();
-    for (const c of children(p)) {
-      all.push(c);
-      queue.push(c);
+    for (const [candidate, info] of table) {
+      if (info.ppid === p) {
+        all.push(candidate);
+        queue.push(candidate);
+      }
     }
   }
   return all;
 }
 
 function sampleRssKb(pid) {
-  return descendants(pid).reduce((sum, p) => sum + readIntFromStatus(p, "VmRSS"), 0);
+  const table = processTable();
+  return descendants(pid, table).reduce((sum, p) => sum + (table.get(p)?.rssKb ?? 0), 0);
 }
 
 async function ensureDisplay() {
@@ -83,7 +83,13 @@ async function ensureDisplay() {
 }
 
 function killTree(pid) {
-  for (const p of descendants(pid).reverse()) {
+  let table;
+  try {
+    table = processTable();
+  } catch {
+    table = new Map(); // ps failed (e.g. process already gone) — just kill the pid itself
+  }
+  for (const p of descendants(pid, table).reverse()) {
     try {
       process.kill(p, "SIGKILL");
     } catch {
@@ -161,11 +167,21 @@ function stats(values) {
   return { mean, p50: percentile(sorted, 0.5), p95: percentile(sorted, 0.95), max: sorted[sorted.length - 1] };
 }
 
+function memoryPressureLine() {
+  const freeGb = os.freemem() / 1024 ** 3;
+  const totalGb = os.totalmem() / 1024 ** 3;
+  return `system memory: ${freeGb.toFixed(1)}GiB free / ${totalGb.toFixed(1)}GiB total`;
+}
+
 async function main() {
   const { env, xvfb } = await ensureDisplay();
   console.log(
     `platform=${process.platform} display-managed=${xvfb !== null} iterations=${ITERATIONS} disablePadding=${DISABLE_PADDING}`,
   );
+  // Idle-memory RSS was observed to vary by ~5x across otherwise-identical runs depending on
+  // ambient system memory pressure (see docs/PROFILING.md) — logging this so results can be
+  // correlated with it rather than treated as a fixed property of the app.
+  console.log(memoryPressureLine());
 
   const runs = [];
   for (let i = 0; i < ITERATIONS; i++) {
@@ -203,6 +219,7 @@ async function main() {
   const steadyWorst = stats(runs.map((r) => r.benchResult.steadyWorstFrameMs));
 
   console.log("\n=== M0 spike report ===");
+  console.log(memoryPressureLine());
   console.log(`successful runs: ${runs.length}/${ITERATIONS}, disablePadding=${DISABLE_PADDING}`);
   console.log(`spawn -> DIFFGRID_READY, decomposed (ms):`);
   console.log(`  total:  mean=${ready.mean.toFixed(1)} p50=${ready.p50.toFixed(1)} p95=${ready.p95.toFixed(1)} max=${ready.max.toFixed(1)}`);
