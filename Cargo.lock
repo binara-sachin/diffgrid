@@ -741,6 +741,7 @@ version = "0.1.0"
 dependencies = [
  "imara-diff",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3692,6 +3693,7 @@ name = "text-io"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]

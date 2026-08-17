@@ -93,6 +93,14 @@ fn open_file_text(path: String) -> Result<Response, String> {
     Ok(Response::new(loaded.normalized.into_bytes()))
 }
 
+/// Viewport-driven per docs/PLAN.md §6: the frontend calls this once per visible `Replace`-hunk
+/// line pair as they scroll into view, not eagerly for the whole file. Thin wrapper — all the
+/// actual logic (and its tests) live in `diff_core::intra_line_spans`.
+#[tauri::command]
+fn intra_line_spans(left_line: String, right_line: String) -> Vec<diff_core::Span> {
+    diff_core::intra_line_spans(&left_line, &right_line)
+}
+
 /// Argv (excluding argv[0]) as handed to the process. `diffgrid FILE1 FILE2` is M1's real
 /// entry point; the frontend falls back to the M0 fixture-benchmark flow when this is empty,
 /// which is exactly how `bench/m0-spike.mjs` invokes the binary today (no arguments).
@@ -125,6 +133,18 @@ fn report_error(message: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the wire format for the same reason as diff-core's `Span` test: a missing
+    /// `rename_all` on a multi-word-field struct produces `undefined` on the frontend with no
+    /// compile-time or IPC-level error, caught only by a crash deep inside unrelated code.
+    #[test]
+    fn open_pair_result_serializes_with_camel_case_field_names() {
+        let result = diff_pair(b"a\n", b"b\n").unwrap();
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.get("leftMeta").is_some());
+        assert!(json.get("rightMeta").is_some());
+        assert!(json["leftMeta"].get("isBinary").is_some());
+    }
 
     #[test]
     fn diffs_two_real_texts_and_reports_per_side_meta() {
@@ -161,7 +181,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             diff_fixture, fixture_text, report_ready, report_bench, report_error, bench_flags,
-            open_file_pair, open_file_text, launch_args
+            open_file_pair, open_file_text, launch_args, intra_line_spans
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

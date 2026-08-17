@@ -1,8 +1,8 @@
-import { EditorState, RangeSetBuilder, Text } from "@codemirror/state";
-import { EditorView, Decoration, type DecorationSet, lineNumbers, keymap } from "@codemirror/view";
+import { EditorState, RangeSetBuilder, StateEffect, StateField, Text } from "@codemirror/state";
+import { EditorView, Decoration, type DecorationSet, ViewPlugin, type ViewUpdate, lineNumbers, keymap } from "@codemirror/view";
 import { defaultKeymap } from "@codemirror/commands";
 import { javascript } from "@codemirror/lang-javascript";
-import type { Hunk } from "./types";
+import type { Hunk, Span } from "./types";
 
 // Must exactly match the line-height set in createDiffEditor's theme below (pinned there,
 // not left to the browser default). Previously an unmeasured guess of 20 against a real
@@ -65,12 +65,160 @@ export function buildDecorations(doc: Text, hunks: Hunk[], side: "left" | "right
   return builder.finish();
 }
 
+export interface LinePair {
+  leftLine: number;
+  rightLine: number;
+}
+
+/**
+ * Which line pairs within a `Replace` hunk need intra-line diffing, restricted to the ones
+ * whose *own-side* (`side`) line number falls in `[fromLine, toLine]`. This is the selection
+ * half of docs/PLAN.md §6's "viewport-driven, not eager" requirement — call it with the current
+ * viewport's line range, not the whole document, or every Replace hunk in a 100k-line file gets
+ * diffed on load regardless of visibility.
+ *
+ * When a Replace hunk's sides have unequal line counts, only the first `min(left.len, right.len)`
+ * lines pair up 1:1 by position; the extra lines on the longer side have no intra-line
+ * counterpart (they're already visually distinguished by the line-highlight + padding
+ * decorations `buildDecorations` applies).
+ */
+export function replaceLinePairsInRange(hunks: Hunk[], side: "left" | "right", fromLine: number, toLine: number): LinePair[] {
+  const pairs: LinePair[] = [];
+  for (const h of hunks) {
+    if (h.kind !== "replace") continue;
+    const n = Math.min(h.left.len, h.right.len);
+    for (let i = 0; i < n; i++) {
+      const leftLine = h.left.start + i + 1;
+      const rightLine = h.right.start + i + 1;
+      const ownLine = side === "left" ? leftLine : rightLine;
+      if (ownLine >= fromLine && ownLine <= toLine) {
+        pairs.push({ leftLine, rightLine });
+      }
+    }
+  }
+  return pairs;
+}
+
+export interface MarkRange {
+  from: number;
+  to: number;
+}
+
+/**
+ * Converts intra-line `Span`s (UTF-16 offsets within one line's text, as returned by the
+ * `intra_line_spans` Tauri command) into absolute CM6 document positions for one specific line
+ * on one specific side. JS strings are UTF-16 already, so `line.from + startUtf16` needs no
+ * further unit conversion.
+ *
+ * Defensive against a stale/out-of-bounds span (e.g. a future cache entry surviving past an
+ * edit that shortened the line) rather than letting CM6 throw on an invalid range.
+ */
+export function spansToMarkRanges(spans: Span[], doc: Text, lineNo: number, side: "left" | "right"): MarkRange[] {
+  if (lineNo < 1 || lineNo > doc.lines) return [];
+  const line = doc.line(lineNo);
+  const ranges: MarkRange[] = [];
+  for (const span of spans) {
+    if (span.side !== side) continue;
+    const from = line.from + span.startUtf16;
+    const to = from + span.lenUtf16;
+    if (to > line.to) continue;
+    ranges.push({ from, to });
+  }
+  return ranges;
+}
+
+export type SpansFetcher = (leftLine: string, rightLine: string) => Promise<Span[]>;
+
+const setIntraLineDecorations = StateEffect.define<DecorationSet>();
+
+const intraLineField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(value, tr) {
+    for (const effect of tr.effects) {
+      if (effect.is(setIntraLineDecorations)) value = effect.value;
+    }
+    return value;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
+
+/**
+ * CM6 extension applying character-level highlight marks to `Replace`-hunk lines, fetched
+ * lazily per docs/PLAN.md §6 as they scroll into view rather than eagerly for the whole file.
+ * `otherDoc` is the opposite pane's document — needed because a line pair's spans depend on
+ * both sides' text, not just this pane's own. Read-only for M1: `otherDoc` is captured once at
+ * construction and never re-read, since neither pane's content can change yet (that's M2).
+ */
+export function intraLineHighlighter(
+  hunks: Hunk[],
+  side: "left" | "right",
+  otherDoc: Text,
+  fetchSpans: SpansFetcher,
+  onFetchError?: (message: string) => void,
+) {
+  const cache = new Map<string, Span[]>();
+  const pending = new Set<string>();
+
+  function rebuild(view: EditorView): DecorationSet {
+    const builder = new RangeSetBuilder<Decoration>();
+    const fromLine = view.state.doc.lineAt(view.viewport.from).number;
+    const toLine = view.state.doc.lineAt(view.viewport.to).number;
+    const ranges: MarkRange[] = [];
+    for (const pair of replaceLinePairsInRange(hunks, side, fromLine, toLine)) {
+      const spans = cache.get(`${pair.leftLine}:${pair.rightLine}`);
+      if (!spans) continue;
+      const ownLine = side === "left" ? pair.leftLine : pair.rightLine;
+      ranges.push(...spansToMarkRanges(spans, view.state.doc, ownLine, side));
+    }
+    ranges.sort((a, b) => a.from - b.from);
+    for (const r of ranges) builder.add(r.from, r.to, Decoration.mark({ class: "diff-intra" }));
+    return builder.finish();
+  }
+
+  const plugin = ViewPlugin.fromClass(
+    class {
+      constructor(view: EditorView) {
+        this.schedule(view);
+      }
+      update(update: ViewUpdate) {
+        if (update.viewportChanged) this.schedule(update.view);
+      }
+      schedule(view: EditorView) {
+        const fromLine = view.state.doc.lineAt(view.viewport.from).number;
+        const toLine = view.state.doc.lineAt(view.viewport.to).number;
+        for (const pair of replaceLinePairsInRange(hunks, side, fromLine, toLine)) {
+          const key = `${pair.leftLine}:${pair.rightLine}`;
+          if (cache.has(key) || pending.has(key)) continue;
+          if (pair.leftLine > view.state.doc.lines && side === "left") continue;
+          pending.add(key);
+          const leftText = side === "left" ? view.state.doc.line(pair.leftLine).text : otherDoc.line(pair.leftLine).text;
+          const rightText = side === "right" ? view.state.doc.line(pair.rightLine).text : otherDoc.line(pair.rightLine).text;
+          fetchSpans(leftText, rightText)
+            .then((spans) => {
+              pending.delete(key);
+              cache.set(key, spans);
+              view.dispatch({ effects: setIntraLineDecorations.of(rebuild(view)) });
+            })
+            .catch((err) => {
+              pending.delete(key);
+              console.error("intra-line fetch failed", key, err);
+              onFetchError?.(err instanceof Error ? `${err.message}\n${err.stack}` : String(err));
+            });
+        }
+      }
+    },
+  );
+
+  return [intraLineField, plugin];
+}
+
 export function createDiffEditor(
   parent: HTMLElement,
   text: string,
   hunks: Hunk[],
   side: "left" | "right",
   disablePadding = false,
+  intraLine?: { otherDoc: Text; fetchSpans: SpansFetcher; onFetchError?: (message: string) => void },
 ): EditorView {
   const doc = Text.of(text.split("\n"));
   const decorations = buildDecorations(doc, hunks, side, disablePadding);
@@ -83,6 +231,9 @@ export function createDiffEditor(
       javascript(),
       EditorState.readOnly.of(true),
       EditorView.decorations.of(decorations),
+      ...(intraLine
+        ? intraLineHighlighter(hunks, side, intraLine.otherDoc, intraLine.fetchSpans, intraLine.onFetchError)
+        : []),
       EditorView.theme({
         "&": { height: "100%", fontSize: "13px" },
         ".cm-scroller": { overflow: "auto", fontFamily: "ui-monospace, Menlo, monospace" },

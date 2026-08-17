@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { Text } from "@codemirror/state";
-import { LINE_HEIGHT_PX, posAfterLine, buildDecorations } from "./diffView";
-import type { Hunk } from "./types";
+import { LINE_HEIGHT_PX, posAfterLine, buildDecorations, replaceLinePairsInRange, spansToMarkRanges } from "./diffView";
+import type { Hunk, Span } from "./types";
 
 describe("posAfterLine", () => {
   const doc = Text.of(["a", "b", "c", "d", "e"]);
@@ -91,5 +91,77 @@ describe("buildDecorations", () => {
     // only the 2 left / 4 right replace-hunk lines should be decorated, never the equal runs
     expect(leftLines.length).toBe(2);
     expect(rightLines.length).toBe(4);
+  });
+});
+
+describe("replaceLinePairsInRange", () => {
+  // hunk 1: a 1:1 replace (left line 2 <-> right line 2)
+  // hunk 2: an unequal replace (left lines 5-6 <-> right lines 5-7); only min(2,3)=2 lines pair
+  const hunks: Hunk[] = [
+    { kind: "equal", left: { start: 0, len: 1 }, right: { start: 0, len: 1 } },
+    { kind: "replace", left: { start: 1, len: 1 }, right: { start: 1, len: 1 } },
+    { kind: "equal", left: { start: 2, len: 2 }, right: { start: 2, len: 2 } },
+    { kind: "replace", left: { start: 4, len: 2 }, right: { start: 4, len: 3 } },
+  ];
+
+  it("never pairs lines from an equal or pure insert/delete hunk", () => {
+    expect(replaceLinePairsInRange(hunks, "left", 1, 100)).not.toContainEqual(
+      expect.objectContaining({ leftLine: 1 }),
+    );
+  });
+
+  it("pairs a simple 1:1 replace by line number", () => {
+    expect(replaceLinePairsInRange(hunks, "left", 1, 100)).toContainEqual({ leftLine: 2, rightLine: 2 });
+  });
+
+  it("pairs only min(left.len, right.len) lines when a replace hunk's sides are unequal", () => {
+    const pairs = replaceLinePairsInRange(hunks, "left", 1, 100).filter((p) => p.leftLine >= 5);
+    expect(pairs).toEqual([
+      { leftLine: 5, rightLine: 5 },
+      { leftLine: 6, rightLine: 6 },
+    ]);
+    // right line 7 has no left counterpart in this hunk and must never appear
+    expect(pairs.some((p) => p.rightLine === 7)).toBe(false);
+  });
+
+  it("filters by the requested side's own line range, not the other side's", () => {
+    // right-side viewport [2,2] should still find the pair anchored at left line 2
+    expect(replaceLinePairsInRange(hunks, "right", 2, 2)).toEqual([{ leftLine: 2, rightLine: 2 }]);
+    expect(replaceLinePairsInRange(hunks, "right", 3, 3)).toEqual([]);
+  });
+
+  it("returns nothing when the range excludes every replace hunk", () => {
+    expect(replaceLinePairsInRange(hunks, "left", 3, 3)).toEqual([]);
+  });
+});
+
+describe("spansToMarkRanges", () => {
+  const doc = Text.of(["one", "hello world", "three"]);
+
+  it("converts a span's UTF-16 offset within a line into absolute document positions", () => {
+    const spans: Span[] = [{ side: "left", startUtf16: 6, lenUtf16: 5 }]; // "world" in line 2
+    const ranges = spansToMarkRanges(spans, doc, 2, "left");
+    const line = doc.line(2);
+    expect(ranges).toEqual([{ from: line.from + 6, to: line.from + 11 }]);
+  });
+
+  it("only includes spans belonging to the requested side", () => {
+    const spans: Span[] = [
+      { side: "left", startUtf16: 0, lenUtf16: 3 },
+      { side: "right", startUtf16: 0, lenUtf16: 3 },
+    ];
+    expect(spansToMarkRanges(spans, doc, 1, "right")).toEqual([{ from: doc.line(1).from, to: doc.line(1).from + 3 }]);
+  });
+
+  it("drops a span that would run past the end of the target line rather than corrupt the range", () => {
+    // defensive: a stale cache entry from before a (hypothetical future) edit should never
+    // produce an out-of-bounds CM6 range
+    const spans: Span[] = [{ side: "left", startUtf16: 0, lenUtf16: 999 }];
+    expect(spansToMarkRanges(spans, doc, 1, "left")).toEqual([]);
+  });
+
+  it("returns nothing for an out-of-range line number", () => {
+    const spans: Span[] = [{ side: "left", startUtf16: 0, lenUtf16: 1 }];
+    expect(spansToMarkRanges(spans, doc, 999, "left")).toEqual([]);
   });
 });

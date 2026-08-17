@@ -1,8 +1,9 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { Text } from "@codemirror/state";
   import { createDiffEditor, syncScroll, runScrollBenchmark } from "$lib/diffView";
-  import type { FileDiffResult, OpenPairResult } from "$lib/types";
+  import type { FileDiffResult, OpenPairResult, Span } from "$lib/types";
 
   const FIXTURE = "100k-line-pair";
   const SCROLL_BENCH_DELAY_MS = 2000;
@@ -51,12 +52,26 @@
 
     const leftText = new TextDecoder().decode(leftBuf);
     const rightText = new TextDecoder().decode(rightBuf);
+    const leftDoc = Text.of(leftText.split("\n"));
+    const rightDoc = Text.of(rightText.split("\n"));
+
+    const fetchSpans = (leftLine: string, rightLine: string) =>
+      invoke<Span[]>("intra_line_spans", { leftLine, rightLine });
+    const onFetchError = (message: string) => invoke("report_error", { message: `intra-line: ${message}` });
 
     status = "mounting editors…";
     const leftEl = document.getElementById("left-pane")!;
     const rightEl = document.getElementById("right-pane")!;
-    const leftView = createDiffEditor(leftEl, leftText, result.diff.hunks, "left");
-    const rightView = createDiffEditor(rightEl, rightText, result.diff.hunks, "right");
+    const leftView = createDiffEditor(leftEl, leftText, result.diff.hunks, "left", false, {
+      otherDoc: rightDoc,
+      fetchSpans,
+      onFetchError,
+    });
+    const rightView = createDiffEditor(rightEl, rightText, result.diff.hunks, "right", false, {
+      otherDoc: leftDoc,
+      fetchSpans,
+      onFetchError,
+    });
     syncScroll(leftView, rightView);
 
     statLine = `+${result.diff.stats.added} -${result.diff.stats.removed} ${result.diff.stats.chunks} chunks`;
@@ -147,6 +162,10 @@
   }
   :global(.diff-line-replace) {
     background-color: rgba(210, 153, 34, 0.25);
+  }
+  :global(.diff-intra) {
+    background-color: rgba(210, 153, 34, 0.55);
+    border-radius: 2px;
   }
   :global(.diff-pad) {
     background: repeating-linear-gradient(
