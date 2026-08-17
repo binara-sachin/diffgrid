@@ -76,3 +76,33 @@ failure mode, and one judged not to be the autonomous-session's call to make sil
 problem it has (the mapping is lossy/non-idempotent in the length-changing direction, so
 `map(map(x)) ≠ x`, which alone would cause feedback-loop drift even if full-pane alignment were
 otherwise addressed). `docs/PROFILING.md` lists candidate next approaches for M1.
+
+## 2026-08-17 — CLI argument parsing lives in the `app` crate for now, not a new `vcs-cli` crate
+
+**Decision**: `diffgrid FILE1 FILE2` argv handling (`launch_args` command in
+`src-tauri/src/lib.rs`, branched on in `+page.svelte`) is implemented directly in the `app`
+crate rather than creating the `vcs-cli` crate PLAN.md §5 describes.
+
+**Why**: `vcs-cli`'s actual scope per PLAN.md is `git difftool`/`mergetool` argument conventions
+and the exit-code contract — real complexity, explicitly assigned to M6, not M1. M1 only needs
+two positional file paths recognized so the real diff pane can be exercised end-to-end; building
+a whole crate (and its own module boundary) for that now would be speculative structure ahead of
+the requirement that actually justifies it.
+
+**How to apply**: when M6's git-integration work starts, this logic should move into a real
+`vcs-cli` crate rather than growing in place inside `app` — `app` is supposed to stay thin
+command/event wiring, and `launch_args`'s current one-line implementation is only appropriate
+because the parsing it does is currently trivial (arg count, nothing else).
+
+## 2026-08-17 — `text-io`'s "streaming reads for large files" (PLAN.md §5) deferred past M1
+
+**Decision**: `text-io::load` takes an in-memory `&[u8]` and the `app` crate reads whole files
+via `std::fs::read` before calling it. No chunked/streaming read path exists yet.
+
+**Why**: M1's read-only two-file-diff slice doesn't need it to be correct or demoable — the
+100k-line benchmark fixture already exercises whole-file reads at a representative size without
+issue. Streaming reads are worth building once there's a concrete multi-hundred-MB file problem
+to solve against, not speculatively.
+
+**How to apply**: if a real file large enough to make `std::fs::read` itself a bottleneck shows
+up (measured, not assumed), that's the trigger to revisit this — not before.
