@@ -36,6 +36,64 @@ pub struct FileDiffResult {
     pub stats: DiffStats,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Side {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Span {
+    pub side: Side,
+    pub start_utf16: u32,
+    pub len_utf16: u32,
+}
+
+/// Character-level diff for one `Replace`-hunk line pair, returning the changed span(s) after
+/// trimming the common prefix and suffix. Offsets are UTF-16 code units (not bytes, not Rust
+/// `char`s) per docs/PLAN.md §3, since that's the unit CM6 uses for all of its own position
+/// arithmetic on the frontend — this must be computed here, not assumed equal to byte length,
+/// or every intra-line highlight touching a non-ASCII character misaligns.
+///
+/// This is prefix/suffix trimming, not a full LCS/Myers character diff: O(n), with no risk of
+/// the quadratic blowup a DP-based algorithm would have on a pathologically long single line.
+/// The cost is not finding a minimal edit script when a line has two separate edits far apart —
+/// they'll span the whole region between them as one "changed" run rather than two small ones.
+/// Acceptable for M1 (see DECISIONS.md); revisit only if this visibly produces unhelpfully large
+/// spans in practice.
+///
+/// Deliberately lazy per docs/PLAN.md §6: this is not called for every `Replace` hunk in a file
+/// eagerly, only per-line as the frontend's viewport requests it, since computing intra-line
+/// spans for every replaced line in a 100k-line file on diff completion is exactly the kind of
+/// eager work the M0 profiling pass spent an entire investigation getting rid of elsewhere.
+pub fn intra_line_spans(left: &str, right: &str) -> Vec<Span> {
+    let l: Vec<u16> = left.encode_utf16().collect();
+    let r: Vec<u16> = right.encode_utf16().collect();
+
+    let mut start = 0;
+    while start < l.len() && start < r.len() && l[start] == r[start] {
+        start += 1;
+    }
+
+    let mut end_l = l.len();
+    let mut end_r = r.len();
+    while end_l > start && end_r > start && l[end_l - 1] == r[end_r - 1] {
+        end_l -= 1;
+        end_r -= 1;
+    }
+
+    let mut spans = Vec::new();
+    if end_l > start {
+        spans.push(Span { side: Side::Left, start_utf16: start as u32, len_utf16: (end_l - start) as u32 });
+    }
+    if end_r > start {
+        spans.push(Span { side: Side::Right, start_utf16: start as u32, len_utf16: (end_r - start) as u32 });
+    }
+    spans
+}
+
 /// Line-level diff via the histogram algorithm. Intra-line spans are deliberately
 /// not computed here — per docs/PLAN.md they are viewport-driven, requested lazily
 /// by the frontend for visible Replace hunks only.
@@ -235,5 +293,81 @@ mod tests {
         assert_eq!(left_pos, 2000);
         assert_eq!(right_pos, 2000);
         assert!(result.stats.chunks > 0);
+    }
+
+    #[test]
+    fn identical_lines_produce_no_intra_line_spans() {
+        assert_eq!(intra_line_spans("same line", "same line"), vec![]);
+    }
+
+    #[test]
+    fn fully_disjoint_lines_span_the_whole_line_on_both_sides() {
+        let spans = intra_line_spans("aaa", "bbb");
+        assert_eq!(
+            spans,
+            vec![
+                Span { side: Side::Left, start_utf16: 0, len_utf16: 3 },
+                Span { side: Side::Right, start_utf16: 0, len_utf16: 3 },
+            ]
+        );
+    }
+
+    #[test]
+    fn common_prefix_and_suffix_are_trimmed_leaving_one_span_per_side() {
+        // digits vs letters in the middle share no characters, so the trim is unambiguous
+        let spans = intra_line_spans("prefix-123-suffix", "prefix-abc-suffix");
+        let prefix_len = "prefix-".encode_utf16().count() as u32;
+        assert_eq!(
+            spans,
+            vec![
+                Span { side: Side::Left, start_utf16: prefix_len, len_utf16: 3 },
+                Span { side: Side::Right, start_utf16: prefix_len, len_utf16: 3 },
+            ]
+        );
+    }
+
+    #[test]
+    fn one_side_being_a_prefix_of_the_other_only_spans_the_longer_side() {
+        let spans = intra_line_spans("abc", "abcdef");
+        assert_eq!(spans, vec![Span { side: Side::Right, start_utf16: 3, len_utf16: 3 }]);
+    }
+
+    #[test]
+    fn empty_vs_nonempty_line_spans_only_the_nonempty_side() {
+        let spans = intra_line_spans("", "new content");
+        assert_eq!(spans, vec![Span { side: Side::Right, start_utf16: 0, len_utf16: 11 }]);
+    }
+
+    /// Regression test for a real bug: `Span` originally lacked `#[serde(rename_all =
+    /// "camelCase")]`, so it serialized as `start_utf16`/`len_utf16` while the frontend's `Span`
+    /// TS interface expected `startUtf16`/`lenUtf16`. The mismatch didn't fail to compile or
+    /// error at the IPC boundary — it silently produced `undefined` on the frontend, which
+    /// arithmetic then turned into `NaN`, which crashed deep inside a CM6 RangeSetBuilder call
+    /// with an error message that named none of the real cause. Caught only by end-to-end
+    /// visual verification under Xvfb, not by any of the unit tests above. This test pins the
+    /// wire format directly so a future field addition can't reintroduce the same class of bug.
+    #[test]
+    fn span_serializes_with_camel_case_field_names_matching_the_frontend_type() {
+        let span = Span { side: Side::Left, start_utf16: 3, len_utf16: 5 };
+        let json = serde_json::to_value(&span).unwrap();
+        assert_eq!(json["side"], "left");
+        assert_eq!(json["startUtf16"], 3);
+        assert_eq!(json["lenUtf16"], 5);
+    }
+
+    #[test]
+    fn offsets_are_counted_in_utf16_code_units_not_chars_or_bytes() {
+        // an astral emoji is 1 char, 4 bytes, but 2 UTF-16 code units -- the offset of the
+        // change after it must reflect that, or every highlight past an emoji misaligns in CM6.
+        let spans = intra_line_spans("a😀b", "a😀c");
+        let prefix_units = "a😀".encode_utf16().count() as u32;
+        assert_eq!(prefix_units, 3); // 'a' (1) + emoji surrogate pair (2)
+        assert_eq!(
+            spans,
+            vec![
+                Span { side: Side::Left, start_utf16: prefix_units, len_utf16: 1 },
+                Span { side: Side::Right, start_utf16: prefix_units, len_utf16: 1 },
+            ]
+        );
     }
 }
