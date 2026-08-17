@@ -4,6 +4,14 @@ Status: **inconclusive on this hardware, with one decisive isolated finding.** D
 headline numbers below as a verdict on Option C until re-run on the actual macOS target — see
 §4. The A/B result in §3, however, is a real architectural finding independent of platform.
 
+**Update**: the scroll-fps/paint-time failure documented in §2-§3 below is historical — it no
+longer reflects the shipped app. `docs/PROFILING.md`'s "Attempt 3" fixed the root cause (switched
+alignment padding from a CM6 block widget to a CSS `padding` line attribute) and is now shipped;
+re-measured with padding enabled, paint is ~99ms and steady scroll is ~54.6fps, matching the
+ceiling §3's A/B only ever showed with padding *disabled*. §2/§3 are kept as-is below since they
+document the root-cause investigation accurately for the state at the time; treat their raw
+numbers as "what the unfixed baseline looked like," not as current behavior.
+
 ## 0. How to reproduce
 
 ```

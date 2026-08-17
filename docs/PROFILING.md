@@ -116,12 +116,63 @@ already approved (full-pane alignment, not just top-line alignment). Reverted in
 padding. Recorded here rather than shipped quietly as "alignment restored," since the numbers
 alone would have said otherwise.
 
+## Attempt 3: CSS padding on a line attribute instead of a block widget — shipped
+
+**Hypothesis**: the root-cause finding above is specific to *block-level* decorations (widgets,
+`block: true`, or block-level `Decoration.replace`) — CM6's height-model oracle only switches out
+of its cheap fixed-line-height path when the document contains one of those, because that's what
+it inspects when deciding whether every line can be assumed to share one measured height. A plain
+`Decoration.line()` attribute that sets `padding-top`/`padding-bottom` via inline CSS is not a
+block decoration at all — CM6 never measures it, so it should never trip the switch — but the
+browser still lays out the extra padding as real box height, so the two panes' subsequent content
+still gets pushed apart by the correct amount. Unlike Attempt 2, this changes *how* space is
+reserved, not *whether* space is reserved — the gap is still real, in-document, full-pane, exactly
+like the original mechanism — so it does not carry Attempt 2's functional-regression risk by
+construction, not just by measurement.
+
+**Implementation**: `buildDecorations` in `src/lib/diffView.ts` replaced the
+`Decoration.widget({ block: true, ... })` call with `Decoration.line({ attributes: { class:
+"diff-pad", style: "padding-top: Npx" } })` (or `padding-bottom` when the gap trails the last line
+of the document, since there's no following line to attach `padding-top` to). `PadWidget` and its
+DOM-node class were deleted. The `.diff-pad` hatched-stripe CSS rule (previously styling the
+widget's own `<div>`) still applies — `padding`, unlike `margin`, is inside the element's
+background-painted box, so the visual "this is filler, not content" treatment survives the
+mechanism change unmodified.
+
+**Result** — 5 runs, padding fully enabled, same 100k-line fixture, same sandbox:
+
+| metric | before (block widget) | after (line padding) |
+|---|---|---|
+| in-app open-to-first-paint | 2684.4ms mean | 98.8ms mean |
+| steady-state scroll fps | 23.3 mean | 54.6 mean |
+| p95 frame time | 110.0ms | 22.0ms |
+| worst frame time | 732.0ms mean | 23.4ms mean |
+| frames >33ms per run | 4-5 | **0** (every run, all 5) |
+
+This matches Attempt 2's measured ceiling (98-101ms paint, 54-58fps) while keeping the padding
+mechanism itself unchanged in kind — real reserved space in each document's own flow, not a
+scroll-position hack layered on top of unmodified documents.
+
+**Visual verification** (the gate Attempt 2 failed, applied here as a precondition rather than an
+afterthought): screenshots taken under Xvfb at 0.5s intervals through the live scroll benchmark.
+One frame caught the exact moment the mechanism was exercised — the right pane one line ahead of
+the left (an unpadded 1-line insert about to scroll into view) — followed by frames showing line
+numbers and content back in 1:1 correspondence at matching pixel Y-positions for 60+ consecutive
+lines afterward, including across a second hunk boundary later in the same scroll. This is the
+*sustained*, full-pane alignment Attempt 2 could not produce (it only ever corrected the single
+line the sync handler actively touched); here every line stays aligned because the browser's own
+box layout is doing the pushing, not a per-frame correction.
+
+**Verdict: shipped.** Real, measured win, and — checked directly rather than assumed — no
+functional regression.
+
 ## Running optimization table
 
 | # | change | metric before | metric after | verdict |
 |---|---|---|---|---|
 | 1 | `estimatedHeight` override + line-height fix | paint 2684ms, 23.3fps | paint 2839ms, 22.2fps | no measurable win — `estimatedHeight` reverted; line-height correction kept (correctness, not perf) |
 | 2 | scroll-position mapping, no padding widgets | paint 2684ms, 23.3fps | paint 100.6ms, 58.1fps | measurable win, **reverted anyway** — functional regression (loses full-pane alignment), confirmed visually |
+| 3 | CSS `padding` line attribute instead of block widget | paint 2684ms, 23.3fps | paint 98.8ms, 54.6fps | measurable win, **shipped** — same reserved-space mechanism, no functional regression, confirmed visually |
 
 ## Correction to M0-RESULTS.md: idle memory is not stable, contradicting the earlier claim
 
@@ -157,20 +208,18 @@ unverified.
 
 ## Where this leaves M1
 
-The shipped state at the end of this pass is **the original M0 baseline**, unchanged in
-behavior, with only the line-height correctness fix applied. The performance ceiling this
-investigation *proved reachable* (98ms paint, 58fps steady, in this same sandbox) requires
-eliminating block-widget alignment padding, and doing so without a functional regression needs
-an approach this pass didn't find in the time available — candidates worth trying next, in
-roughly increasing order of effort:
+**Resolved.** Attempt 3 (CSS padding on a `Decoration.line()` attribute) reaches the same
+performance ceiling as the reverted scroll-mapping attempt — paint 2684ms→98.8ms, fps 23.3→54.6,
+zero frames over 33ms across every run — without its functional regression, verified visually
+under Xvfb rather than assumed from the numbers. This is now shipped, and the block-widget
+alignment-padding problem that blocked M1's diff-pane design is no longer open. M1 can build
+collapsed-unchanged-region widgets (PLAN.md §6) on top of this pane without inheriting the
+non-uniform-height cost, as long as they're implemented the same way — as line attributes, not
+block-level decorations — or verified independently if they can't be.
 
-- Batch/merge adjacent small gaps into fewer, larger widgets (untested here — the sparse-padding
-  probe reduced *count* but not by merging, and even a single widget seems to trigger most of the
-  fixed cost, so this may not help much; worth testing directly before investing further).
-- Render alignment gaps as a separate absolutely-positioned overlay layer *outside* CM6's own
-  document flow (each pane keeps real content at uniform line height; a thin overlay recomputed
-  on scroll draws the visual gap indicators), rather than as CM6 decorations at all.
-- Reconsider whether full pixel-for-pixel mid-pane alignment is required for every hunk, or
-  whether an explicit, deliberate approximation (documented as such, unlike attempt 2) is
-  acceptable for very large files specifically — this is a product decision, not an engineering
-  one, and should go back to the user rather than being decided autonomously.
+One item deliberately not chased further: `disable-padding` A/B runs (58.1fps, zero widgets at
+all) are still marginally faster than Attempt 3's enabled-padding numbers (54.6fps) — a small,
+consistent gap (~3fps) that first-scroll-frame and steady-fps numbers agree on across repeated
+runs. This is far inside the noise band relative to the ~35fps win just banked, and pursuing it
+further is not warranted by the fps>render>launch priority ordering unless a future workload
+shows it actually matters.

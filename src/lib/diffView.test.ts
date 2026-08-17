@@ -1,20 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { Text } from "@codemirror/state";
-import { PadWidget, LINE_HEIGHT_PX, posAfterLine, buildDecorations } from "./diffView";
+import { LINE_HEIGHT_PX, posAfterLine, buildDecorations } from "./diffView";
 import type { Hunk } from "./types";
-
-describe("PadWidget", () => {
-  it("renders a DOM node whose height is the padded line count times LINE_HEIGHT_PX", () => {
-    const widget = new PadWidget(5, "insert");
-    const dom = widget.toDOM();
-    expect(dom.style.height).toBe(`${5 * LINE_HEIGHT_PX}px`);
-  });
-
-  it("scales rendered height with the padded line count", () => {
-    expect(new PadWidget(1, "delete").toDOM().style.height).toBe(`${LINE_HEIGHT_PX}px`);
-    expect(new PadWidget(37, "replace").toDOM().style.height).toBe(`${37 * LINE_HEIGHT_PX}px`);
-  });
-});
 
 describe("posAfterLine", () => {
   const doc = Text.of(["a", "b", "c", "d", "e"]);
@@ -47,12 +34,13 @@ describe("buildDecorations", () => {
   function collect(doc: Text, side: "left" | "right", disablePadding = false) {
     const set = buildDecorations(doc, hunks, side, disablePadding);
     const lines: number[] = [];
-    const widgets: { pos: number; lines: number }[] = [];
+    const margins: { pos: number; style: string }[] = [];
     set.between(0, doc.length, (from, _to, deco) => {
-      if (deco.spec.widget) widgets.push({ pos: from, lines: (deco.spec.widget as PadWidget).lines });
+      const style = deco.spec.attributes?.style;
+      if (style) margins.push({ pos: from, style });
       else lines.push(from);
     });
-    return { lines, widgets };
+    return { lines, margins };
   }
 
   it("highlights every real line in a non-equal hunk on the shorter (left) side", () => {
@@ -65,19 +53,36 @@ describe("buildDecorations", () => {
     expect(lines).toEqual([rightDoc.line(4).from, rightDoc.line(5).from, rightDoc.line(6).from, rightDoc.line(7).from]);
   });
 
-  it("pads the shorter side to align with the longer side's extra lines", () => {
-    const { widgets } = collect(leftDoc, "left");
-    expect(widgets).toEqual([{ pos: leftDoc.line(6).from, lines: 2 }]); // right has 2 more lines than left
+  it("pads the shorter side via a padding-top on the line right after the gap, not a block widget", () => {
+    const { margins } = collect(leftDoc, "left");
+    // right has 2 more lines than left; the gap trails line 6 ("u3"), so line 7 ("u4") gets pushed down
+    expect(margins).toEqual([{ pos: leftDoc.line(6).from, style: `padding-top: ${2 * LINE_HEIGHT_PX}px` }]);
+  });
+
+  it("pads via padding-bottom on the last line when the gap falls at document end", () => {
+    // left: 1 unchanged line, right has 3 extra trailing lines with no left-side line to push down
+    const endHunks: Hunk[] = [
+      { kind: "equal", left: { start: 0, len: 1 }, right: { start: 0, len: 1 } },
+      { kind: "insert", left: { start: 1, len: 0 }, right: { start: 1, len: 3 } },
+    ];
+    const doc = Text.of(["u0"]);
+    const set = buildDecorations(doc, endHunks, "left");
+    const found: { pos: number; style: string }[] = [];
+    set.between(0, doc.length, (from, _to, deco) => {
+      const style = deco.spec.attributes?.style;
+      if (style) found.push({ pos: from, style });
+    });
+    expect(found).toEqual([{ pos: doc.line(1).from, style: `padding-bottom: ${3 * LINE_HEIGHT_PX}px` }]);
   });
 
   it("does not pad the longer side", () => {
-    const { widgets } = collect(rightDoc, "right");
-    expect(widgets).toEqual([]);
+    const { margins } = collect(rightDoc, "right");
+    expect(margins).toEqual([]);
   });
 
   it("omits padding entirely when disablePadding is set", () => {
-    const { widgets } = collect(leftDoc, "left", true);
-    expect(widgets).toEqual([]);
+    const { margins } = collect(leftDoc, "left", true);
+    expect(margins).toEqual([]);
   });
 
   it("never decorates an equal hunk", () => {
