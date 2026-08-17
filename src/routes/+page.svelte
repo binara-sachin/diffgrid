@@ -2,13 +2,13 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { createDiffEditor, syncScroll, runScrollBenchmark } from "$lib/diffView";
-  import type { FileDiffResult } from "$lib/types";
+  import type { FileDiffResult, OpenPairResult } from "$lib/types";
 
   const FIXTURE = "100k-line-pair";
   const SCROLL_BENCH_DELAY_MS = 2000;
   const SCROLL_BENCH_DURATION_MS = 4000;
 
-  let status = $state("loading fixture…");
+  let status = $state("loading…");
   let statLine = $state("");
 
   function doubleRaf(): Promise<void> {
@@ -23,13 +23,46 @@
       invoke("report_error", { message: `unhandledrejection: ${String(e.reason)}` });
     });
     try {
-      await runSpike();
+      const args = await invoke<string[]>("launch_args");
+      if (args.length === 2) {
+        await runRealFiles(args[0], args[1]);
+      } else {
+        await runSpike();
+      }
     } catch (e) {
       const msg = e instanceof Error ? `${e.message}\n${e.stack}` : String(e);
       status = `error: ${msg}`;
       await invoke("report_error", { message: msg });
     }
   });
+
+  /**
+   * M1's real entry point: `diffgrid FILE1 FILE2`. Unlike `runSpike`, this never runs the
+   * synthetic scroll benchmark or the `disablePadding` A/B toggle — those are M0
+   * measurement-harness concerns, not part of the real application.
+   */
+  async function runRealFiles(left: string, right: string) {
+    status = "diffing…";
+    const [result, leftBuf, rightBuf] = await Promise.all([
+      invoke<OpenPairResult>("open_file_pair", { left, right }),
+      invoke<ArrayBuffer>("open_file_text", { path: left }),
+      invoke<ArrayBuffer>("open_file_text", { path: right }),
+    ]);
+
+    const leftText = new TextDecoder().decode(leftBuf);
+    const rightText = new TextDecoder().decode(rightBuf);
+
+    status = "mounting editors…";
+    const leftEl = document.getElementById("left-pane")!;
+    const rightEl = document.getElementById("right-pane")!;
+    const leftView = createDiffEditor(leftEl, leftText, result.diff.hunks, "left");
+    const rightView = createDiffEditor(rightEl, rightText, result.diff.hunks, "right");
+    syncScroll(leftView, rightView);
+
+    statLine = `+${result.diff.stats.added} -${result.diff.stats.removed} ${result.diff.stats.chunks} chunks`;
+    status = "ready";
+    await invoke("report_ready");
+  }
 
   async function runSpike() {
     const t0 = performance.now();
