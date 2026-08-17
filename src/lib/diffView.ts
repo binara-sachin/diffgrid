@@ -6,9 +6,9 @@ import type { Hunk } from "./types";
 
 // Approximation only — the M0 spike doesn't need pixel-perfect alignment, just enough
 // to exercise real decoration + block-widget + scroll-sync rendering cost.
-const LINE_HEIGHT_PX = 20;
+export const LINE_HEIGHT_PX = 20;
 
-class PadWidget extends WidgetType {
+export class PadWidget extends WidgetType {
   constructor(readonly lines: number, readonly kind: string) {
     super();
   }
@@ -26,7 +26,7 @@ class PadWidget extends WidgetType {
   }
 }
 
-function posAfterLine(doc: Text, n: number): number {
+export function posAfterLine(doc: Text, n: number): number {
   if (n <= 0) return 0;
   if (n >= doc.lines) return doc.length;
   return doc.line(n + 1).from;
