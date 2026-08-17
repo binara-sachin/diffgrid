@@ -55,3 +55,24 @@ larger) 50k-file directory-tree fixture; the same reasoning applies here, just n
 
 **How to apply**: `README.md`'s setup instructions must include the fixture-generation command
 as a required step before running the benchmark harness — it is no longer implicit.
+
+## 2026-08-17 — Reverted a measured performance win because it regressed a shipped feature
+
+**Decision**: the scroll-position-mapping alignment mechanism (`alignment.ts`, a rewritten
+`syncScroll`) is not shipped, despite measuring a large, real improvement (paint 2684ms→100ms,
+steady scroll 23fps→58fps in this sandbox). Reverted to the original block-widget padding
+approach. Full writeup in `docs/PROFILING.md` "Attempt 2."
+
+**Why**: verified visually (screenshots mid-scroll, not just the benchmark's numbers) and found
+that alignment only held at the single line the sync mechanism actively corrects — everything
+else visible in the pane drifted, confirmed by reading line numbers/content in the screenshots,
+not by assumption. That's a regression against the UI model already approved earlier in this
+project (`docs/UI/ui-01.png` shows full-pane hatched alignment, not single-point alignment). The
+task's "reject non-wins" rule is about *performance* wins that don't measure out; this was a
+performance win that traded away a different, already-committed requirement — a different
+failure mode, and one judged not to be the autonomous-session's call to make silently.
+
+**How to apply**: don't re-attempt this exact mechanism without first solving the alignment-drift
+problem it has (the mapping is lossy/non-idempotent in the length-changing direction, so
+`map(map(x)) ≠ x`, which alone would cause feedback-loop drift even if full-pane alignment were
+otherwise addressed). `docs/PROFILING.md` lists candidate next approaches for M1.
