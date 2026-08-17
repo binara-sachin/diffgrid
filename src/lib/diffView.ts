@@ -1,5 +1,5 @@
 import { EditorState, RangeSetBuilder, Text } from "@codemirror/state";
-import { EditorView, Decoration, type DecorationSet, WidgetType, lineNumbers, keymap } from "@codemirror/view";
+import { EditorView, Decoration, type DecorationSet, lineNumbers, keymap } from "@codemirror/view";
 import { defaultKeymap } from "@codemirror/commands";
 import { javascript } from "@codemirror/lang-javascript";
 import type { Hunk } from "./types";
@@ -8,24 +8,6 @@ import type { Hunk } from "./types";
 // not left to the browser default). Previously an unmeasured guess of 20 against a real
 // rendered line-height of 18px, so alignment padding was visually wrong by ~10%.
 export const LINE_HEIGHT_PX = 18;
-
-export class PadWidget extends WidgetType {
-  constructor(readonly lines: number, readonly kind: string) {
-    super();
-  }
-  eq(other: PadWidget) {
-    return other.lines === this.lines && other.kind === this.kind;
-  }
-  toDOM() {
-    const div = document.createElement("div");
-    div.className = `diff-pad diff-pad-${this.kind}`;
-    div.style.height = `${this.lines * LINE_HEIGHT_PX}px`;
-    return div;
-  }
-  ignoreEvent() {
-    return true;
-  }
-}
 
 export function posAfterLine(doc: Text, n: number): number {
   if (n <= 0) return 0;
@@ -36,6 +18,15 @@ export function posAfterLine(doc: Text, n: number): number {
 /**
  * Builds line-highlight + alignment-padding decorations for one side of the diff.
  * Hunks are assumed contiguous and gapless across the whole file (diff-core guarantees this).
+ *
+ * Padding is applied as a `padding-top`/`padding-bottom` line attribute, not a block-widget
+ * decoration. CM6's height model only switches to its expensive non-uniform-height layout mode
+ * when the document contains a block widget or replace decoration (see docs/PROFILING.md) — a
+ * plain CSS padding on a line attribute never triggers that switch, since CM6 doesn't inspect
+ * arbitrary line CSS when deciding whether every line shares one fixed height. The browser still
+ * lays the padding out normally, so panes stay visually aligned without paying the layout-mode
+ * cost that made the original block-widget approach not scale (see docs/PROFILING.md's
+ * discriminating-probes table for why per-widget cost wasn't the driver).
  */
 export function buildDecorations(doc: Text, hunks: Hunk[], side: "left" | "right", disablePadding = false): DecorationSet {
   const builder = new RangeSetBuilder<Decoration>();
@@ -56,7 +47,18 @@ export function buildDecorations(doc: Text, hunks: Hunk[], side: "left" | "right
     const pad = otherRange.len - range.len;
     if (pad > 0 && !disablePadding) {
       const pos = posAfterLine(doc, range.start + range.len);
-      builder.add(pos, pos, Decoration.widget({ widget: new PadWidget(pad, h.kind), block: true, side: 1 }));
+      const line = doc.lineAt(pos);
+      const px = pad * LINE_HEIGHT_PX;
+      // pos sits at the next line's start unless the gap trails the very last line of the
+      // document, in which case there is no "next line" to push down — grow the last line's
+      // own box downward instead. padding (not margin) so the .diff-pad hatch background below
+      // still paints the filler space; padding is just as invisible to CM6's height model.
+      const edge = pos === line.from ? "top" : "bottom";
+      builder.add(
+        line.from,
+        line.from,
+        Decoration.line({ attributes: { class: "diff-pad", style: `padding-${edge}: ${px}px` } }),
+      );
     }
   }
 
