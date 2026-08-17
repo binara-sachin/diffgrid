@@ -147,4 +147,93 @@ mod tests {
         assert_eq!(left_pos, 5);
         assert_eq!(right_pos, 5);
     }
+
+    #[test]
+    fn both_empty_produces_no_hunks() {
+        let result = diff_lines("", "");
+        assert!(result.hunks.is_empty());
+        assert_eq!(result.stats.chunks, 0);
+    }
+
+    #[test]
+    fn empty_left_is_pure_insert_of_everything() {
+        let result = diff_lines("", "a\nb\nc\n");
+        assert_eq!(result.hunks.len(), 1);
+        assert_eq!(result.hunks[0].kind, HunkKind::Insert);
+        assert_eq!(result.hunks[0].left.len, 0);
+        assert_eq!(result.hunks[0].right.len, 3);
+    }
+
+    #[test]
+    fn empty_right_is_pure_delete_of_everything() {
+        let result = diff_lines("a\nb\nc\n", "");
+        assert_eq!(result.hunks.len(), 1);
+        assert_eq!(result.hunks[0].kind, HunkKind::Delete);
+        assert_eq!(result.hunks[0].left.len, 3);
+        assert_eq!(result.hunks[0].right.len, 0);
+    }
+
+    /// Characterizes a real gap for M1's text-io layer to handle, not a diff-core bug:
+    /// imara-diff's line tokenizer treats a final line's presence/absence of a trailing
+    /// newline as part of the token itself, so "c" and "c\n" are different tokens even
+    /// though nothing a user would call "the content" changed. Left uncorrected here
+    /// deliberately — normalizing this is a text-io/encoding-layer concern per
+    /// docs/PLAN.md, not diff-core's — but must not be silently undiscovered.
+    #[test]
+    fn missing_trailing_newline_is_seen_as_a_changed_last_line() {
+        let result = diff_lines("a\nb\nc", "a\nb\nc\n");
+        let non_equal: Vec<_> = result.hunks.iter().filter(|h| h.kind != HunkKind::Equal).collect();
+        assert_eq!(non_equal.len(), 1, "expected exactly the last line to show as changed");
+        assert_eq!(non_equal[0].kind, HunkKind::Replace);
+        assert_eq!(non_equal[0].left.len, 1);
+        assert_eq!(non_equal[0].right.len, 1);
+    }
+
+    #[test]
+    fn identical_missing_trailing_newline_on_both_sides_is_unaffected() {
+        let result = diff_lines("a\nb\nc", "a\nb\nc");
+        assert_eq!(result.hunks.len(), 1);
+        assert_eq!(result.hunks[0].kind, HunkKind::Equal);
+        assert_eq!(result.stats.chunks, 0);
+    }
+
+    #[test]
+    fn very_long_single_line_replace_does_not_panic_or_misclassify() {
+        let long_a = "x".repeat(100_000);
+        let long_b = format!("{}{}", "x".repeat(50_000), "y".repeat(50_000));
+        let result = diff_lines(&format!("a\n{long_a}\nc\n"), &format!("a\n{long_b}\nc\n"));
+        let replaces: Vec<_> = result.hunks.iter().filter(|h| h.kind == HunkKind::Replace).collect();
+        assert_eq!(replaces.len(), 1);
+        assert_eq!(replaces[0].left.len, 1);
+        assert_eq!(replaces[0].right.len, 1);
+    }
+
+    #[test]
+    fn large_synthetic_file_hunks_remain_contiguous_and_gapless() {
+        // Regression coverage at a scale closer to the fixtures used for benchmarking,
+        // without depending on the (gitignored, generated) fixture files existing on disk.
+        let mut left = String::new();
+        let mut right = String::new();
+        for i in 0..2000 {
+            left.push_str(&format!("line_{i}\n"));
+            if i % 37 == 0 {
+                right.push_str(&format!("changed_{i}\n"));
+            } else {
+                right.push_str(&format!("line_{i}\n"));
+            }
+        }
+
+        let result = diff_lines(&left, &right);
+        let mut left_pos = 0u32;
+        let mut right_pos = 0u32;
+        for h in &result.hunks {
+            assert_eq!(h.left.start, left_pos, "gap or overlap in left ranges");
+            assert_eq!(h.right.start, right_pos, "gap or overlap in right ranges");
+            left_pos += h.left.len;
+            right_pos += h.right.len;
+        }
+        assert_eq!(left_pos, 2000);
+        assert_eq!(right_pos, 2000);
+        assert!(result.stats.chunks > 0);
+    }
 }
