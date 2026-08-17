@@ -4,9 +4,10 @@ import { defaultKeymap } from "@codemirror/commands";
 import { javascript } from "@codemirror/lang-javascript";
 import type { Hunk } from "./types";
 
-// Approximation only — the M0 spike doesn't need pixel-perfect alignment, just enough
-// to exercise real decoration + block-widget + scroll-sync rendering cost.
-export const LINE_HEIGHT_PX = 20;
+// Must exactly match the line-height set in createDiffEditor's theme below (pinned there,
+// not left to the browser default). Previously an unmeasured guess of 20 against a real
+// rendered line-height of 18px, so alignment padding was visually wrong by ~10%.
+export const LINE_HEIGHT_PX = 18;
 
 export class PadWidget extends WidgetType {
   constructor(readonly lines: number, readonly kind: string) {
@@ -83,6 +84,9 @@ export function createDiffEditor(
       EditorView.theme({
         "&": { height: "100%", fontSize: "13px" },
         ".cm-scroller": { overflow: "auto", fontFamily: "ui-monospace, Menlo, monospace" },
+        // Pinned so it exactly matches LINE_HEIGHT_PX rather than trusting the browser
+        // default to happen to agree with it.
+        ".cm-line": { lineHeight: `${LINE_HEIGHT_PX}px` },
       }),
     ],
   });
