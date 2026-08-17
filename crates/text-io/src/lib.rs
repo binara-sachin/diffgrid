@@ -276,6 +276,27 @@ mod tests {
         assert_eq!(loaded.normalized, "a\nb\n");
     }
 
+    /// Pins the wire format: `FileMeta`'s multi-word fields must serialize as camelCase to
+    /// match the frontend's `FileMeta` TS interface. See diff-core's identically-motivated test
+    /// on `Span` for the real bug this class of test caught (a missing `rename_all` produced
+    /// `undefined` on the frontend with no compile-time or IPC-level error at all).
+    #[test]
+    fn file_meta_serializes_with_camel_case_field_names_matching_the_frontend_type() {
+        let meta = FileMeta {
+            encoding: Encoding::Utf16Le,
+            line_ending: LineEnding::Crlf,
+            trailing_newline: true,
+            is_binary: false,
+            line_count: 7,
+        };
+        let json = serde_json::to_value(&meta).unwrap();
+        assert_eq!(json["encoding"], "utf16Le");
+        assert_eq!(json["lineEnding"], "crlf");
+        assert_eq!(json["trailingNewline"], true);
+        assert_eq!(json["isBinary"], false);
+        assert_eq!(json["lineCount"], 7);
+    }
+
     #[test]
     fn load_detects_binary_and_refuses_to_decode() {
         let loaded = load(b"PK\x03\x04\0binary\0stuff");

@@ -38,3 +38,11 @@ export interface OpenPairResult {
   leftMeta: FileMeta;
   rightMeta: FileMeta;
 }
+
+export type SpanSide = "left" | "right";
+
+export interface Span {
+  side: SpanSide;
+  startUtf16: number;
+  lenUtf16: number;
+}
