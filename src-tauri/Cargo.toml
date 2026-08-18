@@ -25,3 +25,4 @@ serde_json = "1"
 diff-core = { path = "../crates/diff-core" }
 text-io = { path = "../crates/text-io" }
 session = { path = "../crates/session" }
+dirwalk = { path = "../crates/dirwalk" }
