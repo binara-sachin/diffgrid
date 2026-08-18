@@ -12,4 +12,5 @@ vite.config.ts.timestamp-*
 src-tauri/gen
 /fixtures/100k-line-pair
 /fixtures/10k-line-pair
+/fixtures/50k-file-tree
 
