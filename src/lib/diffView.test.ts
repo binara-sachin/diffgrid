@@ -11,6 +11,9 @@ import {
   COLLAPSE_MIN_HUNK_LINES,
   createDiffEditor,
   updateHunks,
+  changeHunkLines,
+  nextHunkIndex,
+  prevHunkIndex,
 } from "./diffView";
 import type { Hunk, Span } from "./types";
 
@@ -260,5 +263,48 @@ describe("updateHunks", () => {
     updateHunks(view, [{ kind: "equal", left: { start: 0, len: 3 }, right: { start: 0, len: 3 } }]);
     expect(view.dom.querySelectorAll(".diff-intra").length).toBe(0);
     view.destroy();
+  });
+});
+
+describe("changeHunkLines", () => {
+  it("returns the first line of each non-equal hunk, in document order", () => {
+    const hunks: Hunk[] = [
+      { kind: "equal", left: { start: 0, len: 2 }, right: { start: 0, len: 2 } },
+      { kind: "replace", left: { start: 2, len: 1 }, right: { start: 2, len: 1 } },
+      { kind: "equal", left: { start: 3, len: 5 }, right: { start: 3, len: 5 } },
+      { kind: "insert", left: { start: 8, len: 0 }, right: { start: 8, len: 2 } },
+    ];
+    expect(changeHunkLines(hunks)).toEqual([
+      { left: 3, right: 3 },
+      { left: 9, right: 9 },
+    ]);
+  });
+
+  it("returns an empty array when every hunk is equal", () => {
+    const hunks: Hunk[] = [{ kind: "equal", left: { start: 0, len: 5 }, right: { start: 0, len: 5 } }];
+    expect(changeHunkLines(hunks)).toEqual([]);
+  });
+});
+
+describe("nextHunkIndex / prevHunkIndex", () => {
+  it("advances from -1 (nothing selected yet) to the first hunk", () => {
+    expect(nextHunkIndex(3, -1)).toBe(0);
+  });
+
+  it("wraps forward past the last hunk back to the first", () => {
+    expect(nextHunkIndex(3, 2)).toBe(0);
+  });
+
+  it("wraps backward past the first hunk to the last", () => {
+    expect(prevHunkIndex(3, 0)).toBe(2);
+  });
+
+  it("moving backward from -1 lands on the last hunk, not an invalid index", () => {
+    expect(prevHunkIndex(3, -1)).toBe(2);
+  });
+
+  it("returns -1 for both directions when there are no hunks to navigate", () => {
+    expect(nextHunkIndex(0, -1)).toBe(-1);
+    expect(prevHunkIndex(0, -1)).toBe(-1);
   });
 });
