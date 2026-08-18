@@ -578,4 +578,34 @@ mod tests {
         assert!(entries.iter().any(|e| e.path == "a/b/c/deep.txt"));
         assert!(!entries.iter().any(|e| e.path.contains('\\')));
     }
+
+    /// Not part of the regular suite (`#[ignore]`d, and skips instead of failing when the
+    /// gitignored fixture hasn't been generated) -- measures whether the two-phase design's
+    /// "walk left fully before any row can stream" cost risks the ≤1s first-rows target from
+    /// docs/PLAN.md §7 at the scale that target is written against. Run explicitly with:
+    /// `cargo test -p dirwalk --release -- --ignored --nocapture measure_scan_timing`
+    /// after generating the fixture: `node fixtures/gen/gen-file-tree.mjs 50000 fixtures/50k-file-tree 7`
+    #[test]
+    #[ignore]
+    fn measure_scan_timing_against_the_50k_fixture() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/50k-file-tree");
+        let (left, right) = (root.join("left"), root.join("right"));
+        if !left.is_dir() || !right.is_dir() {
+            eprintln!("skipping: fixtures/50k-file-tree not generated (see doc comment for the gen command)");
+            return;
+        }
+        let cancel = AtomicBool::new(false);
+        let mut first_batch_at: Option<std::time::Duration> = None;
+        let start = std::time::Instant::now();
+        let outcome = scan(&left, &right, &ScanOptions::default(), &cancel, |_batch| {
+            if first_batch_at.is_none() {
+                first_batch_at = Some(start.elapsed());
+            }
+        });
+        let total = start.elapsed();
+        eprintln!(
+            "first batch at {:?}, total scan {:?}, left_visited={}, right_visited={}, entries_emitted={}",
+            first_batch_at, total, outcome.left_visited, outcome.right_visited, outcome.entries_emitted
+        );
+    }
 }
