@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke, Channel } from "@tauri-apps/api/core";
   import { Text } from "@codemirror/state";
   import type { EditorView } from "@codemirror/view";
   import {
@@ -22,7 +22,7 @@
     type ViewportIndicator,
     type EditDelta,
   } from "$lib/diffView";
-  import type { FileDiffResult, Hunk, OpenPairResult, Span } from "$lib/types";
+  import type { DirEntry, FileDiffResult, Hunk, OpenPairResult, ScanOutcome, Span } from "$lib/types";
 
   const FIXTURE = "100k-line-pair";
   const SCROLL_BENCH_DELAY_MS = 2000;
@@ -33,9 +33,14 @@
   // which is exactly the per-keystroke cost the delta pipeline exists to avoid elsewhere.
   const EDIT_REDIFF_DEBOUNCE_MS = 300;
 
+  // "loading": nothing decided yet. "spike": M0 benchmark flow (no launch args). "files":
+  // M1/M2's two-way file-pair view. "dirs": M3's directory-compare view. A row opened from
+  // "dirs" switches to "files"; "Back to directory list" switches back without re-scanning
+  // (dirEntries is kept, not cleared, by backToDirList).
+  let mode = $state<"loading" | "spike" | "files" | "dirs">("loading");
+  const isRealFileMode = $derived(mode === "files");
   let status = $state("loading…");
   let statLine = $state("");
-  let isRealFileMode = $state(false);
   let ignoreWhitespace = $state(false);
   let ignoreCase = $state(false);
   let dirtyLeft = $state(false);
@@ -47,6 +52,17 @@
   // frontend's concern, same as it already is for open_file_pair/open_file_text).
   let leftPath = "";
   let rightPath = "";
+
+  // M3: set once a directory scan has been run, so a file pair opened from a row knows to show
+  // "Back to directory list" and knows what it means (root paths + the already-fetched entry
+  // list survive a round trip to "files" mode and back, so returning never re-scans).
+  let dirLeftRoot = $state("");
+  let dirRightRoot = $state("");
+  let dirEntries: DirEntry[] = $state([]);
+  let dirScanning = $state(false);
+  let dirScanOutcome: ScanOutcome | null = $state(null);
+  let hideIdentical = $state(true);
+  const visibleDirEntries = $derived(hideIdentical ? dirEntries.filter((e) => e.status !== "same") : dirEntries);
 
   // Populated by runRealFiles; read by retoggleDiffOptions and hunk navigation. leftView/
   // rightView aren't read in the template, so plain variables suffice; changeLines and
@@ -72,6 +88,55 @@
   let editQueueLeft: Promise<void> = Promise.resolve();
   let editQueueRight: Promise<void> = Promise.resolve();
   let redoDiffTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function hasUnsavedChanges(): boolean {
+    return dirtyLeft || dirtyRight;
+  }
+
+  /** Only relevant once a file pair is actually open -- a fresh "loading"/"dirs" mode has
+   * nothing to lose, so callers that might run before any file has ever been opened don't need
+   * their own `mode === "files"` guard as well as this one. */
+  function confirmDiscardIfDirty(): boolean {
+    if (!hasUnsavedChanges()) return true;
+    return window.confirm("You have unsaved changes. Discard them and continue?");
+  }
+
+  /**
+   * Tears down the currently-open file pair's entire live state -- both `EditorView`s, the
+   * debounce timer, the per-side edit queues, and every piece of derived UI state. Required
+   * once M3 makes opening a *second* file pair (from a directory-scan row) a real, reachable
+   * flow: `runRealFiles` originally ran exactly once per process, so nothing ever reset this
+   * state between opens. Left un-reset, a queued `apply_edit` for the *previous* pair could
+   * land against the newly-seeded `EditBuffer` for the new one (real corruption, not a cosmetic
+   * glitch), and a pending debounced `redo_diff` would fire against the wrong pair entirely.
+   * Does NOT check `hasUnsavedChanges()` itself -- callers that can discard real work (opening a
+   * new row, going back to the list) must call `confirmDiscardIfDirty()` first and bail out
+   * before calling this.
+   */
+  function resetFileViewState() {
+    leftView?.destroy();
+    rightView?.destroy();
+    leftView = undefined;
+    rightView = undefined;
+    if (redoDiffTimer !== undefined) {
+      clearTimeout(redoDiffTimer);
+      redoDiffTimer = undefined;
+    }
+    editQueueLeft = Promise.resolve();
+    editQueueRight = Promise.resolve();
+    dirtyLeft = false;
+    dirtyRight = false;
+    savingLeft = false;
+    savingRight = false;
+    changeLines = [];
+    currentChangeHunks = [];
+    currentHunk = -1;
+    minimapSegments = [];
+    viewportIndicator = { topFrac: 0, heightFrac: 1 };
+    totalLines = 0;
+    leftPath = "";
+    rightPath = "";
+  }
 
   function applyNewHunks(hunks: FileDiffResult["hunks"]) {
     if (!leftView || !rightView) return;
@@ -242,7 +307,18 @@
     try {
       const args = await invoke<string[]>("launch_args");
       if (args.length === 2) {
-        await runRealFiles(args[0], args[1]);
+        const [leftKind, rightKind] = await Promise.all([
+          invoke<string>("path_kind", { path: args[0] }),
+          invoke<string>("path_kind", { path: args[1] }),
+        ]);
+        if (leftKind !== rightKind) {
+          throw new Error(`cannot compare a ${leftKind} with a ${rightKind}: ${args[0]} vs ${args[1]}`);
+        }
+        if (leftKind === "dir") {
+          await runDirCompare(args[0], args[1]);
+        } else {
+          await runRealFiles(args[0], args[1]);
+        }
       } else {
         await runSpike();
       }
@@ -257,9 +333,14 @@
    * M1/M2's real entry point: `diffgrid FILE1 FILE2`. Unlike `runSpike`, this never runs the
    * synthetic scroll benchmark or the `disablePadding` A/B toggle — those are M0
    * measurement-harness concerns, not part of the real application. M2 adds: both panes
-   * editable, edits forwarded to Rust's `EditBuffer`s, debounced re-diff.
+   * editable, edits forwarded to Rust's `EditBuffer`s, debounced re-diff. M3 adds: this can now
+   * run a *second* time in the same session (opening a row from the directory-compare view),
+   * so it resets any previously-open pair's live state before doing anything else -- callers
+   * that might be discarding unsaved work must have already confirmed that via
+   * `confirmDiscardIfDirty()` before calling this.
    */
   async function runRealFiles(left: string, right: string) {
+    resetFileViewState();
     leftPath = left;
     rightPath = right;
     status = "diffing…";
@@ -309,7 +390,7 @@
       (deltas) => onEdit("right", deltas),
     );
     syncScroll(leftView, rightView);
-    isRealFileMode = true;
+    mode = "files";
     // Sets changeLines/currentChangeHunks/currentHunk/minimapSegments/totalLines consistently
     // with every later re-diff, rather than duplicating that logic here -- a prior version of
     // this function set changeLines directly but never set currentChangeHunks, which stayed
@@ -326,6 +407,7 @@
   }
 
   async function runSpike() {
+    mode = "spike";
     const t0 = performance.now();
 
     const [flags, diff, leftBuf, rightBuf] = await Promise.all([
@@ -360,6 +442,72 @@
       });
     }, SCROLL_BENCH_DELAY_MS);
   }
+
+  /**
+   * M3's real entry point for `diffgrid DIR1 DIR2`. Streams `DirEntry` batches from `scan_dirs`
+   * over a `Channel` into `dirEntries` as they arrive -- the scan itself is what's incremental
+   * (docs/PLAN.md §3); this just appends whatever shows up, in whatever order it arrives.
+   */
+  async function runDirCompare(left: string, right: string) {
+    dirLeftRoot = left;
+    dirRightRoot = right;
+    dirEntries = [];
+    dirScanOutcome = null;
+    dirScanning = true;
+    mode = "dirs";
+    status = "scanning…";
+
+    const channel = new Channel<DirEntry[]>();
+    channel.onmessage = (batch) => {
+      dirEntries = [...dirEntries, ...batch];
+    };
+
+    try {
+      const outcome = await invoke<ScanOutcome>("scan_dirs", {
+        left,
+        right,
+        respectGitignore: true,
+        excludeGlobs: [],
+        channel,
+      });
+      dirScanOutcome = outcome;
+      status = outcome.cancelled ? `scan cancelled — ${dirEntries.length} entries found before stopping` : "ready";
+    } catch (e) {
+      status = `scan failed: ${e}`;
+      await invoke("report_error", { message: `scan_dirs: ${e}` });
+    } finally {
+      dirScanning = false;
+    }
+    await invoke("report_ready");
+  }
+
+  function cancelDirScan() {
+    invoke("cancel_scan");
+  }
+
+  /**
+   * A row is only meaningful to open as a two-way text diff when both sides are actual regular
+   * files with real content to compare -- a directory (its "Same"/"Modified" status already
+   * says nothing about its children, which have their own rows), a symlink (diffing two link
+   * *targets* as text is a different, unimplemented feature), or a LeftOnly/RightOnly/
+   * TypeConflict entry (no meaningful "other side" to diff against) are all excluded.
+   */
+  function isOpenable(entry: DirEntry): boolean {
+    return !entry.isDir && !entry.isSymlink && (entry.status === "same" || entry.status === "modified");
+  }
+
+  async function openRowAsFilePair(entry: DirEntry) {
+    if (!isOpenable(entry)) return;
+    if (!confirmDiscardIfDirty()) return;
+    await runRealFiles(`${dirLeftRoot}/${entry.path}`, `${dirRightRoot}/${entry.path}`);
+  }
+
+  function backToDirList() {
+    if (!confirmDiscardIfDirty()) return;
+    resetFileViewState();
+    mode = "dirs";
+    status = "ready";
+  }
 </script>
 
 <main>
@@ -367,6 +515,9 @@
   <div class="stat">{statLine}</div>
   {#if isRealFileMode}
     <div class="toolbar">
+      {#if dirLeftRoot}
+        <button onclick={backToDirList}>&larr; Back to directory list</button>
+      {/if}
       <button onclick={() => goToHunk(-1)} disabled={changeLines.length === 0}>&uarr; Prev diff</button>
       <button onclick={() => goToHunk(1)} disabled={changeLines.length === 0}>&darr; Next diff</button>
       <span class="hunk-count">{changeLines.length === 0 ? "no changes" : `${currentHunk + 1} / ${changeLines.length}`}</span>
@@ -392,7 +543,49 @@
       </button>
     </div>
   {/if}
-  <div class="panes">
+  {#if mode === "dirs"}
+    <div class="toolbar">
+      <button onclick={cancelDirScan} disabled={!dirScanning}>Cancel scan</button>
+      <label>
+        <input type="checkbox" bind:checked={hideIdentical} />
+        Hide identical
+      </label>
+      <span class="hunk-count">
+        {visibleDirEntries.length} of {dirEntries.length} entries shown
+        {dirScanOutcome?.cancelled ? " (cancelled)" : ""}
+      </span>
+    </div>
+    <div class="dir-table-wrap">
+      <table class="dir-table">
+        <thead>
+          <tr>
+            <th>Path</th>
+            <th>Status</th>
+            <th>Size (left)</th>
+            <th>Size (right)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each visibleDirEntries as entry (entry.path)}
+            <!-- svelte-ignore a11y_click_events_have_key_events -->
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <tr class="status-{entry.status}" class:openable={isOpenable(entry)} onclick={() => openRowAsFilePair(entry)}>
+              <td>{entry.path}{entry.isDir ? "/" : ""}</td>
+              <td>{entry.status}</td>
+              <td>{entry.sizeLeft ?? ""}</td>
+              <td>{entry.sizeRight ?? ""}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+  {/if}
+  <!-- Always mounted, even outside file-pair mode: runRealFiles/runSpike look these elements up
+       by id synchronously when they start, and switching `mode` doesn't repaint the DOM until
+       the next tick -- removing this from the DOM under an {#if} would make the very first
+       file pair opened from a directory-scan row (mode: "dirs" -> "files") a race against
+       Svelte's own reactivity. Hidden via CSS instead, which doesn't affect DOM queries. -->
+  <div class="panes" class:hidden={mode === "dirs"}>
     <div id="left-pane" class="pane"></div>
     <div id="right-pane" class="pane"></div>
     {#if isRealFileMode}
@@ -505,6 +698,50 @@
     flex: 1 1 50%;
     min-width: 0;
     overflow: hidden;
+  }
+  .panes.hidden {
+    display: none;
+  }
+  .dir-table-wrap {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+  }
+  .dir-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .dir-table th,
+  .dir-table td {
+    text-align: left;
+    padding: 3px 8px;
+    border-bottom: 1px solid #eee;
+    white-space: nowrap;
+  }
+  .dir-table th {
+    position: sticky;
+    top: 0;
+    background: #f5f5f5;
+  }
+  .dir-table tr.openable {
+    cursor: pointer;
+  }
+  .dir-table tr.openable:hover {
+    background: #eef4ff;
+  }
+  .dir-table tr.status-modified {
+    color: #9a6700;
+  }
+  .dir-table tr.status-leftOnly {
+    color: #cf222e;
+  }
+  .dir-table tr.status-rightOnly {
+    color: #1a7f37;
+  }
+  .dir-table tr.status-typeConflict {
+    color: #cf222e;
+    font-weight: bold;
   }
 
   :global(.diff-line-insert) {

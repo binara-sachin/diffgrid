@@ -46,3 +46,22 @@ export interface Span {
   startUtf16: number;
   lenUtf16: number;
 }
+
+export type EntryStatus = "same" | "modified" | "leftOnly" | "rightOnly" | "typeConflict";
+
+export interface DirEntry {
+  path: string;
+  status: EntryStatus;
+  isDir: boolean;
+  isSymlink: boolean;
+  symlinkTarget: string | null;
+  sizeLeft: number | null;
+  sizeRight: number | null;
+}
+
+export interface ScanOutcome {
+  cancelled: boolean;
+  leftVisited: number;
+  rightVisited: number;
+  entriesEmitted: number;
+}
