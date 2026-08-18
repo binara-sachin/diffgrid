@@ -24,7 +24,7 @@
     type EditDelta,
   } from "$lib/diffView";
   import type { DiffStats, DirEntry, FileDiffResult, Hunk, OpenPairResult, ScanOutcome, Settings, Span } from "$lib/types";
-  import { visibleDirTreeRows, type DirTreeRow } from "$lib/dirView";
+  import { buildDirTree, countDirTreeFiles, flattenDirTree, pruneDirTree, type DirTreeRow } from "$lib/dirView";
   import { createTabId, tabLabel } from "$lib/tabs";
 
   const FIXTURE = "100k-line-pair";
@@ -67,9 +67,14 @@
   // wrapping doesn't observe Set.add/delete by reference alone.
   let collapsedDirPaths: Set<string> = $state(new Set());
   // Entries arrive in scan order (and the left-only tail is HashMap iteration order, so it's not
-  // even deterministic run to run) -- visibleDirTreeRows (tested in dirView.test.ts) groups them
-  // into a real nested tree, sorted by name at each level, per PLAN.md's M4 "sidebar tree."
-  const dirTreeRows = $derived(visibleDirTreeRows(dirEntries, hideIdentical, collapsedDirPaths));
+  // even deterministic run to run) -- groups them into a real nested tree (tested in
+  // dirView.test.ts), sorted by name at each level, per PLAN.md's M4 "sidebar tree."
+  const dirTree = $derived(pruneDirTree(buildDirTree(dirEntries), hideIdentical));
+  const dirTreeRows = $derived(flattenDirTree(dirTree, collapsedDirPaths));
+  // Total changed-file count, independent of collapsedDirPaths -- computed from the pruned tree
+  // directly rather than dirTreeRows.filter(!isDir).length, since that would undercount whenever
+  // a folder containing changed files is currently collapsed.
+  const changedFileCount = $derived(countDirTreeFiles(dirTree));
 
   function toggleDirCollapsed(path: string) {
     if (collapsedDirPaths.has(path)) collapsedDirPaths.delete(path);
@@ -718,7 +723,7 @@
           </label>
         </div>
         <div class="sidebar-header">
-          CHANGED FILES · {dirTreeRows.filter((r) => !r.isDir).length}
+          CHANGED FILES · {changedFileCount}
           {dirScanOutcome?.cancelled ? " (cancelled)" : ""}
         </div>
         <div class="dir-table-wrap">

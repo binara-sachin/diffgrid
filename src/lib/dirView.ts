@@ -101,3 +101,16 @@ export function flattenDirTree(node: DirTreeNode, collapsedPaths: ReadonlySet<st
 export function visibleDirTreeRows(entries: DirEntry[], hideIdentical: boolean, collapsedPaths: ReadonlySet<string>): DirTreeRow[] {
   return flattenDirTree(pruneDirTree(buildDirTree(entries), hideIdentical), collapsedPaths);
 }
+
+/** Total file (non-folder) count across the whole tree, regardless of collapse state -- the
+ * "CHANGED FILES · N" header count must reflect every changed file whether or not its parent
+ * folder happens to be collapsed right now, so it's computed from the pruned tree directly
+ * rather than from `flattenDirTree`'s (collapse-sensitive) row list. */
+export function countDirTreeFiles(node: DirTreeNode): number {
+  let count = 0;
+  for (const child of node.children) {
+    if (child.isDir) count += countDirTreeFiles(child);
+    else count += 1;
+  }
+  return count;
+}

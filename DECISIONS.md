@@ -628,3 +628,18 @@ isn't a pure frontend transform like the tree grouping was; it would need either
 line-count-only diff per changed file during the scan (a real scan-side cost this milestone hasn't
 measured) or computing it lazily on first sidebar render. Left as a documented gap rather than
 silently building a wrong/fake number.
+
+## 2026-08-18 — Fixed: CHANGED FILES count undercounted when a folder was collapsed
+
+**Decision**: the sidebar's "CHANGED FILES · N" header count is now computed from
+`countDirTreeFiles` over the pruned tree directly, not from `dirTreeRows.filter(!isDir).length`.
+
+**Why**: caught by advisor review, not by my own testing, despite having personally collapsed a
+folder and screenshotted the sidebar minutes earlier in the same session without noticing —
+`dirTreeRows` is the *rendered* row list, which `flattenDirTree` deliberately omits a collapsed
+folder's children from; counting rows meant a collapsed folder's changed files silently
+disappeared from the header count along with their rows, even though they're still real changes
+the scan found. Reproduced concretely: 2 changed files under `src/lib/`, header correctly read
+"· 2" while expanded, dropped to "· 1" the moment `src/` was collapsed. `countDirTreeFiles`
+(new in `dirView.ts`, unit-tested) recurses the tree unconditionally, independent of
+`collapsedPaths`, so the count and the collapse/expand UI state are no longer coupled.
