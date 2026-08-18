@@ -474,17 +474,20 @@ in parallel. A one-tab bar is harmless, and maintaining two separate rendering p
 duplication.
 
 **Sidebar is a compact path + status-sigil list, not M3's four-column table**: a 260px sidebar
-can't fit path/status/size-left/size-right as separate columns. Per-entry size is now shown on
-hover-equivalent... actually not shown at all currently (see the tooltip finding below) -- status
-is conveyed by a single sigil character (`~`/`+`/`-`/`!`) plus the existing color-coding, matching
-real tools' sidebar conventions (git status characters, VS Code's Source Control view) rather than
-a wordy column this width can't accommodate. `DirEntry.sizeLeft`/`sizeRight` are unused by the UI
-right now as a result -- the data isn't gone, just not surfaced; a future affordance (a details
-pane, a status-bar readout on selection) can pick it back up without a scan-side change.
+can't fit path/status/size-left/size-right as separate columns. Status is conveyed by a single
+sigil character (`~`/`+`/`-`/`!`) plus the existing color-coding, matching real tools' sidebar
+conventions (git status characters, VS Code's Source Control view) rather than a wordy column
+this width can't accommodate. Per-entry size was originally going to be shown via a hover
+tooltip, but that turned out to trigger a real WebKitGTK rendering bug (see the entry right
+below) and was dropped rather than replaced with something else. `DirEntry.sizeLeft`/`sizeRight`
+are unused by the UI right now as a result -- the data isn't gone, just not surfaced; a future
+affordance (a details pane, a status-bar readout on selection) can pick it back up without a
+scan-side change.
+
 **Sidebar tree note**: this remains a flat, sorted list (M3's `dirView.ts`), not yet a real
 collapsible directory tree -- M3's own DECISIONS.md entry deferred that to M4 "when built"; it
-was not built in this pass either, and remains open (see the M4 status entry once this pass is
-summarized).
+was not built in this pass either. Tracked as its own open task (upgrade the sidebar to a real
+tree), not silently dropped.
 
 ## 2026-08-18 — WebKitGTK native `title` tooltips render as an unstyled black box under this Xvfb sandbox
 

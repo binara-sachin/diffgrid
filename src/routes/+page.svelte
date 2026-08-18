@@ -481,6 +481,12 @@
 
   async function runSpike() {
     mode = "spike";
+    // The spike panes are `display:none` until `mode === "spike"` (see the template) -- without
+    // waiting a tick here, `document.getElementById` below would race Svelte's own DOM update,
+    // the same trap `openFileTab` guards against explicitly. Relying on the `await Promise.all`
+    // below to *happen* to give Svelte a chance to flush first is exactly the kind of "probably
+    // works" timing dependency that trap exists to avoid.
+    await tick();
     const t0 = performance.now();
 
     const [flags, diff, leftBuf, rightBuf] = await Promise.all([
@@ -502,7 +508,7 @@
 
     await doubleRaf();
     const paintMs = performance.now() - t0;
-    status = "ready";
+    status = `ready — +${diff.stats.added} -${diff.stats.removed} ${diff.stats.chunks} chunks · open-to-first-paint ${paintMs.toFixed(1)}ms`;
     await invoke("report_ready");
 
     setTimeout(async () => {
@@ -971,13 +977,6 @@
     width: 100%;
     border-collapse: collapse;
     font-size: 12px;
-  }
-  .dir-table tr {
-    /* WebKit has a long-standing bug rendering :focus outlines on display:table-row elements
-       as a large filled block instead of a thin border -- reproduced here (not hypothetical)
-       under Xvfb/WebKitGTK after clicking a row, since a clicked element becomes focusable.
-       See PLATFORM_NOTES.md. */
-    outline: none;
   }
   .dir-table td {
     text-align: left;
