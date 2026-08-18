@@ -425,3 +425,89 @@ virtualizing the results table (bounding DOM node count regardless of entry coun
 one variable that would remove the suspected dominant cost (full keyed-`{#each}` reorders) rather
 than just reducing how often it's triggered -- but treat that as a hypothesis to test properly, not
 a conclusion to build on. See PLATFORM_NOTES.md for the Xvfb/no-WM caveat on these measurements.
+
+## 2026-08-18 — M4: multiple open-file tabs, keyed by a frontend-generated `TabId`
+
+**Decision**: M2's `SessionState` (one `Mutex<Option<EditBuffer>>` per side, exactly one open
+pair) becomes `SessionState { tabs: Mutex<HashMap<TabId, TabBuffers>> }`, where `TabBuffers`
+holds *both* sides of one tab under a single lock. Every edit-pipeline command (`open_file_pair`,
+`apply_edit`, `redo_diff`, `save_file`) gains a `tab_id: String` parameter; a new `close_tab`
+command frees a tab's buffers. The frontend mirrors this with a `tabs: FileTab[]` array (dirty
+flags, hunk state, minimap geometry -- plain Svelte-reactive data) plus a separate, deliberately
+non-reactive `tabRuntimes: Map<string, TabRuntime>` holding the live `EditorView` instances and
+edit-queue promises.
+
+**Why**: docs/PLAN.md's M4 description ("wrapping M1-M3 as one session") and the `session` crate's
+own module-boundary doc ("open-file edit buffers" plural) both call for more than one open file
+pair. Keying by `TabId` rather than replacing a single slot is the natural generalization -- and
+turned out to be a strict simplification on the Rust side too: with both sides of a tab under one
+map-entry lock, `redo_diff_impl` is trivially consistent (impossible to read a left snapshot from
+one instant and a right from another), removing the "lock both, in a fixed order" discipline the
+old dual-`Mutex` shape needed specifically to avoid that hazard. Keeping `EditorView`s out of
+Svelte's `$state` is a direct application of docs/PLAN.md §1's own stated principle ("mixing two
+reactive systems over the same hot-path DOM is asking for dropped frames") -- a CM6 view has no
+business being deep-proxied.
+
+**How to apply**: any future per-tab feature (the settings resolved-per-tab override mentioned in
+docs/PLAN.md §5, still to come) should add fields to `FileTab`, not introduce a second id scheme.
+
+## 2026-08-18 — M4 unifies the M3 flat table and the M1/M2 file view into one persistent layout
+
+**Decision**: a directory-rooted session shows a sidebar (root paths + a changed-files list) and
+the main tab/toolbar/panes area *simultaneously*, per docs/UI/ui-01.png's mockup -- not M3's
+full-page table with a "Back to directory list" button toggling between two mutually-exclusive
+views. Opening a row opens (or focuses, if already open) a tab; the sidebar never disappears.
+`mode` collapses M3's separate `"files"`/`"dirs"` states into one `"session"` state, with a new
+`sessionKind: "file" | "dir" | null` distinguishing whether a sidebar applies at all (a bare
+`diffgrid FILE1 FILE2` invocation gets no sidebar, just its one tab).
+
+**Why**: building the M3 toggle-based layout as an intermediate step and then immediately
+replacing it with the mockup's unified layout in the very next milestone would be pure throwaway
+work -- the target layout was already known from the mockup before any M4 code was written, so
+there was no reason to build the thing being replaced.
+
+**A related simplification**: a bare two-file CLI invocation still opens through the same
+`openFileTab`/tab-bar machinery a directory session's rows use (one auto-opened tab, tab bar
+shown even for a single tab) rather than keeping M1/M2's chrome-less single-pane code path alive
+in parallel. A one-tab bar is harmless, and maintaining two separate rendering paths for
+"one file pair" (with vs. without a tab bar) for a cosmetic difference wasn't worth the
+duplication.
+
+**Sidebar is a compact path + status-sigil list, not M3's four-column table**: a 260px sidebar
+can't fit path/status/size-left/size-right as separate columns. Per-entry size is now shown on
+hover-equivalent... actually not shown at all currently (see the tooltip finding below) -- status
+is conveyed by a single sigil character (`~`/`+`/`-`/`!`) plus the existing color-coding, matching
+real tools' sidebar conventions (git status characters, VS Code's Source Control view) rather than
+a wordy column this width can't accommodate. `DirEntry.sizeLeft`/`sizeRight` are unused by the UI
+right now as a result -- the data isn't gone, just not surfaced; a future affordance (a details
+pane, a status-bar readout on selection) can pick it back up without a scan-side change.
+**Sidebar tree note**: this remains a flat, sorted list (M3's `dirView.ts`), not yet a real
+collapsible directory tree -- M3's own DECISIONS.md entry deferred that to M4 "when built"; it
+was not built in this pass either, and remains open (see the M4 status entry once this pass is
+summarized).
+
+## 2026-08-18 — WebKitGTK native `title` tooltips render as an unstyled black box under this Xvfb sandbox
+
+**Decision**: dropped the sidebar row's `title` attribute (a hover tooltip showing left/right
+file size) rather than debugging WebKitGTK's native tooltip rendering further.
+
+**Why**: manual Xvfb verification of the new sidebar surfaced a real, 100%-reproducible visual
+bug -- a solid black rectangle appeared below the changed-files list every time a row was clicked
+(the `xdotool`-driven mouse stayed stationary over the row afterward, which is exactly a tooltip
+trigger condition). Ruled out several structural hypotheses first (an unstyled `overflow:auto`
+container's default background, a WebKit `outline`-on-`table-row` rendering bug) by testing each
+in isolation and watching the artifact survive both fixes unchanged; adding temporary debug
+outlines around every layout element made it vanish once by coincidental timing, which briefly
+looked like a false lead before a clean re-run reproduced it again 3/3 times. Removing the `title`
+attribute (and only that) made it disappear cleanly across 3/3 fresh launches. This was cheap
+scope to drop -- the sizeTitle tooltip was a speculative addition on top of what the sidebar
+redesign required, not a stated requirement -- so no replacement UI was built for it (see the
+sidebar-compaction entry above for where that information could resurface later).
+
+**How to apply**: don't add native `title` attributes to interactive/clickable elements in this
+app without checking they render correctly under Xvfb first -- this specific failure mode (a
+filled block instead of rendered text) is plausibly tied to this sandbox's GPU-less/software
+WebKitGTK rendering path (see PLATFORM_NOTES.md's existing "Rendering engine differences not yet
+characterized at all" entry) and may simply not reproduce on the real macOS/WKWebView target, but
+that hasn't been verified either way -- treat any future native tooltip as needing the same
+Xvfb-first check this one got, until macOS says otherwise.

@@ -167,3 +167,20 @@ correct via a real backend round-trip (a temporary debug print showed `cancel_sc
 **Verify on macOS**: click Cancel during a large real-world directory comparison (a big
 `node_modules` tree is a good candidate) and confirm it's reasonably responsive; if not, see the
 DECISIONS.md entry's "How to apply" for the next lever (table virtualization).
+
+## M4 (session shell): a real, reproducible WebKitGTK rendering bug, not just an unverified caveat
+
+**Native `title` attributes render as a solid unstyled black rectangle instead of a tooltip with
+text, at least on hover-then-click sequences under this sandbox.** Discovered while building the
+M4 sidebar: a `title` attribute added to a clickable row (to show file sizes on hover) produced a
+100%-reproducible black box appearing below the sidebar's list after clicking a row -- confirmed
+across 6+ fresh launch-and-click cycles with the `title` attribute present, and 0/6 with it
+removed. See DECISIONS.md for the elimination process (two other structural hypotheses were tested
+and ruled out first). This is plausibly tied to this sandbox's GPU-less/software-rendered WebKitGTK
+path (`libEGL warning: DRI3 error` at every launch -- see the existing "Rendering engine
+differences not yet characterized at all" entry above), which may not reproduce on the real macOS
+WKWebView target at all. **Verify on macOS**: if any future feature wants a native tooltip
+(`title` attribute) on an interactive element, hover it and confirm real text renders, not a blank
+or malformed box, before trusting it there -- this repo currently has zero native tooltips in use
+specifically because of this finding, so there's nothing existing to spot-check, only future
+additions to gate.

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { invoke, Channel } from "@tauri-apps/api/core";
   import { Text } from "@codemirror/state";
   import type { EditorView } from "@codemirror/view";
@@ -22,8 +22,9 @@
     type ViewportIndicator,
     type EditDelta,
   } from "$lib/diffView";
-  import type { DirEntry, FileDiffResult, Hunk, OpenPairResult, ScanOutcome, Span } from "$lib/types";
+  import type { DiffStats, DirEntry, FileDiffResult, Hunk, OpenPairResult, ScanOutcome, Span } from "$lib/types";
   import { visibleDirEntries as visibleDirEntriesFn } from "$lib/dirView";
+  import { createTabId, tabLabel } from "$lib/tabs";
 
   const FIXTURE = "100k-line-pair";
   const SCROLL_BENCH_DELAY_MS = 2000;
@@ -34,29 +35,18 @@
   // which is exactly the per-keystroke cost the delta pipeline exists to avoid elsewhere.
   const EDIT_REDIFF_DEBOUNCE_MS = 300;
 
-  // "loading": nothing decided yet. "spike": M0 benchmark flow (no launch args). "files":
-  // M1/M2's two-way file-pair view. "dirs": M3's directory-compare view. A row opened from
-  // "dirs" switches to "files"; "Back to directory list" switches back without re-scanning
-  // (dirEntries is kept, not cleared, by backToDirList).
-  let mode = $state<"loading" | "spike" | "files" | "dirs">("loading");
-  const isRealFileMode = $derived(mode === "files");
+  // "loading": nothing decided yet. "spike": M0 benchmark flow (no launch args). "session":
+  // M1-M3 unified per M4 (docs/PLAN.md M4) -- one or more open file-pair tabs, plus (when the
+  // root pair is a directory comparison) a sidebar of changed files to open tabs from.
+  let mode = $state<"loading" | "spike" | "session">("loading");
   let status = $state("loading…");
-  let statLine = $state("");
-  let ignoreWhitespace = $state(false);
-  let ignoreCase = $state(false);
-  let dirtyLeft = $state(false);
-  let dirtyRight = $state(false);
-  let savingLeft = $state(false);
-  let savingRight = $state(false);
-  // The paths runRealFiles opened -- save_file needs these to know where to write back to,
-  // since EditBuffer only holds the bytes/text, not the path it came from (that's the
-  // frontend's concern, same as it already is for open_file_pair/open_file_text).
-  let leftPath = "";
-  let rightPath = "";
 
-  // M3: set once a directory scan has been run, so a file pair opened from a row knows to show
-  // "Back to directory list" and knows what it means (root paths + the already-fetched entry
-  // list survive a round trip to "files" mode and back, so returning never re-scans).
+  // Which kind of root this session was opened on -- determines whether the sidebar shows.
+  // `null` until launch args are resolved in onMount.
+  let sessionKind: "file" | "dir" | null = $state(null);
+
+  // M3: populated once a directory scan has run. Root paths + the already-fetched entry list are
+  // session-lifetime state, independent of which (if any) file tabs are currently open.
   let dirLeftRoot = $state("");
   let dirRightRoot = $state("");
   let dirEntries: DirEntry[] = $state([]);
@@ -69,164 +59,179 @@
   // flat-table-is-a-complete-capability scope call in DECISIONS.md.
   const visibleDirEntries = $derived(visibleDirEntriesFn(dirEntries, hideIdentical));
 
-  // Populated by runRealFiles; read by retoggleDiffOptions and hunk navigation. leftView/
-  // rightView aren't read in the template, so plain variables suffice; changeLines and
-  // currentHunk are, so they need $state for the toolbar to update.
-  let leftView: EditorView | undefined;
-  let rightView: EditorView | undefined;
-  let changeLines: ChangeHunkLine[] = $state([]);
-  // Parallel to changeLines (same filter, same order -- see changeHunks), kept separately
-  // because copyCurrentHunk needs the full Hunk (kind + both LineRanges), which
-  // ChangeHunkLine's two bare line numbers don't carry.
-  let currentChangeHunks: Hunk[] = [];
-  let currentHunk = $state(-1);
-  let minimapSegments: MinimapSegment[] = $state([]);
-  let viewportIndicator: ViewportIndicator = $state({ topFrac: 0, heightFrac: 1 });
-  let totalLines = 0;
-
-  // M2's edit pipeline: apply_edit calls for a given side must land at Rust in the exact order
-  // CM6 produced them (each one's offsets are only valid against the buffer state the previous
-  // one left behind) even though `invoke` is async and its IPC round-trip could otherwise let
-  // calls resolve out of order. Chaining each call onto a per-side promise means the next one
-  // is only *issued* once the previous one's response has come back, without blocking typing
-  // itself (nothing here awaits these chains except the debounced re-diff, below).
-  let editQueueLeft: Promise<void> = Promise.resolve();
-  let editQueueRight: Promise<void> = Promise.resolve();
-  let redoDiffTimer: ReturnType<typeof setTimeout> | undefined;
-
-  function hasUnsavedChanges(): boolean {
-    return dirtyLeft || dirtyRight;
-  }
-
-  /** Only relevant once a file pair is actually open -- a fresh "loading"/"dirs" mode has
-   * nothing to lose, so callers that might run before any file has ever been opened don't need
-   * their own `mode === "files"` guard as well as this one. */
-  function confirmDiscardIfDirty(): boolean {
-    if (!hasUnsavedChanges()) return true;
-    return window.confirm("You have unsaved changes. Discard them and continue?");
-  }
-
   /**
-   * Tears down the currently-open file pair's entire live state -- both `EditorView`s, the
-   * debounce timer, the per-side edit queues, and every piece of derived UI state. Required
-   * once M3 makes opening a *second* file pair (from a directory-scan row) a real, reachable
-   * flow: `runRealFiles` originally ran exactly once per process, so nothing ever reset this
-   * state between opens. Left un-reset, a queued `apply_edit` for the *previous* pair could
-   * land against the newly-seeded `EditBuffer` for the new one (real corruption, not a cosmetic
-   * glitch), and a pending debounced `redo_diff` would fire against the wrong pair entirely.
-   * Does NOT check `hasUnsavedChanges()` itself -- callers that can discard real work (opening a
-   * new row, going back to the list) must call `confirmDiscardIfDirty()` first and bail out
-   * before calling this.
+   * M4's per-tab reactive UI state -- one `FileTab` per open file-pair tab. Deliberately holds
+   * only plain, Svelte-reactive data (dirty flags, hunk lists, minimap geometry); the live
+   * `EditorView` instances and edit-queue promises live in `tabRuntimes` below, *not* here, per
+   * docs/PLAN.md §1's "diff panes are managed imperatively... mixing two reactive systems over
+   * the same hot-path DOM is asking for dropped frames" -- a CM6 `EditorView` has no business
+   * being deep-proxied by Svelte's `$state`.
    */
-  function resetFileViewState() {
-    leftView?.destroy();
-    rightView?.destroy();
-    leftView = undefined;
-    rightView = undefined;
-    if (redoDiffTimer !== undefined) {
-      clearTimeout(redoDiffTimer);
-      redoDiffTimer = undefined;
-    }
-    editQueueLeft = Promise.resolve();
-    editQueueRight = Promise.resolve();
-    dirtyLeft = false;
-    dirtyRight = false;
-    savingLeft = false;
-    savingRight = false;
-    changeLines = [];
-    currentChangeHunks = [];
-    currentHunk = -1;
-    minimapSegments = [];
-    viewportIndicator = { topFrac: 0, heightFrac: 1 };
-    totalLines = 0;
-    leftPath = "";
-    rightPath = "";
+  interface FileTab {
+    id: string;
+    leftPath: string;
+    rightPath: string;
+    label: string;
+    dirtyLeft: boolean;
+    dirtyRight: boolean;
+    savingLeft: boolean;
+    savingRight: boolean;
+    changeLines: ChangeHunkLine[];
+    // Parallel to changeLines (same filter, same order -- see changeHunks), kept separately
+    // because copyCurrentHunk needs the full Hunk (kind + both LineRanges), which
+    // ChangeHunkLine's two bare line numbers don't carry.
+    currentChangeHunks: Hunk[];
+    currentHunk: number;
+    minimapSegments: MinimapSegment[];
+    viewportIndicator: ViewportIndicator;
+    totalLines: number;
+    ignoreWhitespace: boolean;
+    ignoreCase: boolean;
+    diffStats: DiffStats | null;
   }
 
-  function applyNewHunks(hunks: FileDiffResult["hunks"]) {
-    if (!leftView || !rightView) return;
-    updateHunks(leftView, hunks);
-    updateHunks(rightView, hunks);
-    changeLines = changeHunkLines(hunks);
-    currentChangeHunks = changeHunks(hunks);
+  /** The live, non-reactive half of a tab's state -- kept out of `$state` on purpose (see
+   * `FileTab`'s doc comment). `editQueueLeft`/`editQueueRight` are M2's per-side promise chains
+   * (see `onEdit`): each `apply_edit` call is only *issued* once the previous one for that same
+   * (tab, side) has resolved, so deltas always land at Rust in the order CM6 produced them, even
+   * though `invoke` is async and could otherwise let calls resolve out of order. */
+  interface TabRuntime {
+    leftView: EditorView;
+    rightView: EditorView;
+    editQueueLeft: Promise<void>;
+    editQueueRight: Promise<void>;
+    redoDiffTimer: ReturnType<typeof setTimeout> | undefined;
+  }
+
+  let tabs: FileTab[] = $state([]);
+  let activeTabId: string | null = $state(null);
+  const activeTab = $derived(tabs.find((t) => t.id === activeTabId) ?? null);
+  const tabRuntimes = new Map<string, TabRuntime>();
+
+  function getTab(id: string): FileTab | undefined {
+    return tabs.find((t) => t.id === id);
+  }
+
+  function newFileTab(id: string, leftPath: string, rightPath: string): FileTab {
+    return {
+      id,
+      leftPath,
+      rightPath,
+      label: tabLabel(leftPath, rightPath),
+      dirtyLeft: false,
+      dirtyRight: false,
+      savingLeft: false,
+      savingRight: false,
+      changeLines: [],
+      currentChangeHunks: [],
+      currentHunk: -1,
+      minimapSegments: [],
+      viewportIndicator: { topFrac: 0, heightFrac: 1 },
+      totalLines: 0,
+      ignoreWhitespace: false,
+      ignoreCase: false,
+      diffStats: null,
+    };
+  }
+
+  function applyNewHunksFor(id: string, hunks: Hunk[]) {
+    const tab = getTab(id);
+    const rt = tabRuntimes.get(id);
+    if (!tab || !rt) return;
+    updateHunks(rt.leftView, hunks);
+    updateHunks(rt.rightView, hunks);
+    tab.changeLines = changeHunkLines(hunks);
+    tab.currentChangeHunks = changeHunks(hunks);
     // Deliberately reset rather than trying to re-point at "the same" hunk post-copy: a copy
     // changes the hunk list (the copied hunk usually disappears, and every hunk after it can
     // shift), the same as any other hunks-invalidating event (a toggle, another edit) already
     // does. Consistent behavior across all of those beats trying to preserve a selection that
     // may no longer refer to anything meaningful.
-    currentHunk = -1;
+    tab.currentHunk = -1;
     // Refreshed here, not just at open: an edit can add or remove lines, so a re-diff's hunk
     // list may no longer match the line count the minimap was last computed against.
-    totalLines = leftView.state.doc.lines;
-    minimapSegments = computeMinimapSegments(hunks, totalLines);
+    tab.totalLines = rt.leftView.state.doc.lines;
+    tab.minimapSegments = computeMinimapSegments(hunks, tab.totalLines);
   }
 
-  function updateViewportIndicator() {
-    if (!leftView) return;
-    const { scrollTop, scrollHeight, clientHeight } = leftView.scrollDOM;
-    viewportIndicator = computeViewportIndicator(scrollTop, scrollHeight, clientHeight);
+  function updateViewportIndicatorFor(id: string) {
+    const tab = getTab(id);
+    const rt = tabRuntimes.get(id);
+    if (!tab || !rt) return;
+    const { scrollTop, scrollHeight, clientHeight } = rt.leftView.scrollDOM;
+    tab.viewportIndicator = computeViewportIndicator(scrollTop, scrollHeight, clientHeight);
   }
 
-  function onMinimapClick(e: MouseEvent) {
-    if (!leftView || totalLines === 0) return;
+  function onMinimapClick(id: string, e: MouseEvent) {
+    const tab = getTab(id);
+    const rt = tabRuntimes.get(id);
+    if (!tab || !rt || tab.totalLines === 0) return;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    scrollToLine(leftView, minimapClickToLine((e.clientY - rect.top) / rect.height, totalLines));
+    scrollToLine(rt.leftView, minimapClickToLine((e.clientY - rect.top) / rect.height, tab.totalLines));
   }
 
   /**
-   * Re-diffs against the Rust-side `EditBuffer`s' *current* text (which reflects any edits
-   * applied via `apply_edit` since open, not just the text as it was when the file was opened)
-   * with the current whitespace/case-ignore toggles. Replaces M1's `diff_texts`, which sent
-   * `leftText`/`rightText` from the frontend on every call -- once edits exist, holding a
+   * Re-diffs one tab against the Rust-side `EditBuffer`s' *current* text (which reflects any
+   * edits applied via `apply_edit` since open, not just the text as it was when the file was
+   * opened) with that tab's whitespace/case-ignore toggles. Replaces M1's `diff_texts`, which
+   * sent `leftText`/`rightText` from the frontend on every call -- once edits exist, holding a
    * frontend copy of "the text" at all just invites sending a stale one, so the toggle path and
    * the edit-re-diff path now share one mechanism with one source of truth.
    *
    * Awaits both edit queues first so a re-diff (whether from a toggle click or the debounced
-   * timer below) never races an `apply_edit` call that's still in flight for the same edit.
+   * timer below) never races an `apply_edit` call that's still in flight for the same tab.
    */
-  async function flushAndRedoDiff(): Promise<FileDiffResult> {
-    await Promise.all([editQueueLeft, editQueueRight]);
-    const diff = await invoke<FileDiffResult>("redo_diff", { ignoreWhitespace, ignoreCase });
-    applyNewHunks(diff.hunks);
-    statLine = `+${diff.stats.added} -${diff.stats.removed} ${diff.stats.chunks} chunks`;
+  async function flushAndRedoDiffFor(id: string): Promise<FileDiffResult | undefined> {
+    const tab = getTab(id);
+    const rt = tabRuntimes.get(id);
+    if (!tab || !rt) return undefined;
+    await Promise.all([rt.editQueueLeft, rt.editQueueRight]);
+    const diff = await invoke<FileDiffResult>("redo_diff", { tabId: id, ignoreWhitespace: tab.ignoreWhitespace, ignoreCase: tab.ignoreCase });
+    applyNewHunksFor(id, diff.hunks);
+    tab.diffStats = diff.stats;
     return diff;
   }
 
-  async function retoggleDiffOptions() {
-    if (!leftView || !rightView) return;
+  async function retoggleDiffOptions(id: string) {
+    if (!tabRuntimes.has(id)) return;
     status = "re-diffing…";
-    await flushAndRedoDiff();
+    await flushAndRedoDiffFor(id);
     status = "ready";
   }
 
-  function scheduleDebouncedRedoDiff() {
-    if (redoDiffTimer !== undefined) clearTimeout(redoDiffTimer);
-    redoDiffTimer = setTimeout(() => {
-      redoDiffTimer = undefined;
-      flushAndRedoDiff().catch((err) => invoke("report_error", { message: `redo_diff: ${err}` }));
+  function scheduleDebouncedRedoDiff(id: string) {
+    const rt = tabRuntimes.get(id);
+    if (!rt) return;
+    if (rt.redoDiffTimer !== undefined) clearTimeout(rt.redoDiffTimer);
+    rt.redoDiffTimer = setTimeout(() => {
+      rt.redoDiffTimer = undefined;
+      flushAndRedoDiffFor(id).catch((err) => invoke("report_error", { message: `redo_diff(${id}): ${err}` }));
     }, EDIT_REDIFF_DEBOUNCE_MS);
   }
 
   /**
    * The frontend -> Rust half of docs/PLAN.md §2's delta pipeline: forwards each delta CM6
-   * captured to the matching `EditBuffer`, then (debounced) triggers a re-diff. `side` is fixed
-   * per call site (see `runRealFiles`), not derived from the delta, since `EditDelta` itself
-   * carries no side information -- it's purely a CM6-document-relative offset pair.
+   * captured to the matching tab's `EditBuffer`, then (debounced) triggers a re-diff. `side` is
+   * fixed per call site (see `mountFileTab`), not derived from the delta, since `EditDelta`
+   * itself carries no side information -- it's purely a CM6-document-relative offset pair.
    */
-  function onEdit(side: "left" | "right", deltas: EditDelta[]) {
-    if (side === "left") dirtyLeft = true;
-    else dirtyRight = true;
+  function onEdit(id: string, side: "left" | "right", deltas: EditDelta[]) {
+    const tab = getTab(id);
+    const rt = tabRuntimes.get(id);
+    if (!tab || !rt) return;
+    if (side === "left") tab.dirtyLeft = true;
+    else tab.dirtyRight = true;
     for (const delta of deltas) {
       const send = (): Promise<void> =>
-        invoke<void>("apply_edit", { side, fromUtf16: delta.fromUtf16, toUtf16: delta.toUtf16, inserted: delta.inserted }).catch(
+        invoke<void>("apply_edit", { tabId: id, side, fromUtf16: delta.fromUtf16, toUtf16: delta.toUtf16, inserted: delta.inserted }).catch(
           (err) => {
-            invoke("report_error", { message: `apply_edit(${side}): ${err}` });
+            invoke("report_error", { message: `apply_edit(${id}/${side}): ${err}` });
           },
         );
-      if (side === "left") editQueueLeft = editQueueLeft.then(send);
-      else editQueueRight = editQueueRight.then(send);
+      if (side === "left") rt.editQueueLeft = rt.editQueueLeft.then(send);
+      else rt.editQueueRight = rt.editQueueRight.then(send);
     }
-    scheduleDebouncedRedoDiff();
+    scheduleDebouncedRedoDiff(id);
   }
 
   /**
@@ -238,29 +243,34 @@
    * since a failed save leaving `dirty*` set is exactly the correct outcome -- the file on disk
    * genuinely doesn't match the buffer yet.
    */
-  async function saveSide(side: "left" | "right") {
-    const path = side === "left" ? leftPath : rightPath;
+  async function saveSide(id: string, side: "left" | "right") {
+    const tab = getTab(id);
+    const rt = tabRuntimes.get(id);
+    if (!tab || !rt) return;
+    const path = side === "left" ? tab.leftPath : tab.rightPath;
     if (!path) return;
-    if (side === "left") savingLeft = true;
-    else savingRight = true;
+    if (side === "left") tab.savingLeft = true;
+    else tab.savingRight = true;
     try {
-      await (side === "left" ? editQueueLeft : editQueueRight);
-      await invoke("save_file", { side, path });
-      if (side === "left") dirtyLeft = false;
-      else dirtyRight = false;
+      await (side === "left" ? rt.editQueueLeft : rt.editQueueRight);
+      await invoke("save_file", { tabId: id, side, path });
+      if (side === "left") tab.dirtyLeft = false;
+      else tab.dirtyRight = false;
     } catch (err) {
       status = `save failed (${side}): ${err}`;
-      await invoke("report_error", { message: `save_file(${side}): ${err}` });
+      await invoke("report_error", { message: `save_file(${id}/${side}): ${err}` });
     } finally {
-      if (side === "left") savingLeft = false;
-      else savingRight = false;
+      if (side === "left") tab.savingLeft = false;
+      else tab.savingRight = false;
     }
   }
 
-  function goToHunk(direction: 1 | -1) {
-    if (!leftView || changeLines.length === 0) return;
-    currentHunk = direction === 1 ? nextHunkIndex(changeLines.length, currentHunk) : prevHunkIndex(changeLines.length, currentHunk);
-    scrollToLine(leftView, changeLines[currentHunk].left);
+  function goToHunk(id: string, direction: 1 | -1) {
+    const tab = getTab(id);
+    const rt = tabRuntimes.get(id);
+    if (!tab || !rt || tab.changeLines.length === 0) return;
+    tab.currentHunk = direction === 1 ? nextHunkIndex(tab.changeLines.length, tab.currentHunk) : prevHunkIndex(tab.changeLines.length, tab.currentHunk);
+    scrollToLine(rt.leftView, tab.changeLines[tab.currentHunk].left);
   }
 
   /**
@@ -270,17 +280,137 @@
    * on the destination view, so it flows through the exact same onEdit → apply_edit →
    * debounced redo_diff pipeline a keystroke would, with no separate backend command.
    */
-  function copyCurrentHunk(direction: "leftToRight" | "rightToLeft") {
-    if (!leftView || !rightView || currentHunk === -1) return;
-    const hunk = currentChangeHunks[currentHunk];
-    const change = buildHunkCopyChange(hunk, direction, leftView.state.doc, rightView.state.doc);
+  function copyCurrentHunk(id: string, direction: "leftToRight" | "rightToLeft") {
+    const tab = getTab(id);
+    const rt = tabRuntimes.get(id);
+    if (!tab || !rt || tab.currentHunk === -1) return;
+    const hunk = tab.currentChangeHunks[tab.currentHunk];
+    const change = buildHunkCopyChange(hunk, direction, rt.leftView.state.doc, rt.rightView.state.doc);
     if (!change) return;
-    const destView = change.destSide === "left" ? leftView : rightView;
+    const destView = change.destSide === "left" ? rt.leftView : rt.rightView;
     destView.dispatch({ changes: { from: change.from, to: change.to, insert: change.insert } });
   }
 
   function doubleRaf(): Promise<void> {
     return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  }
+
+  /**
+   * Mounts the CM6 editors for a tab that's already been pushed into `tabs` (and whose panes
+   * therefore already exist in the DOM, per the `await tick()` in `openFileTab`). Split out from
+   * `openFileTab` so the id-generation/array-push/DOM-wait steps stay in one place and this part
+   * -- the actual `invoke` calls and editor construction -- doesn't have to be duplicated for a
+   * future second entry point.
+   */
+  async function mountFileTab(id: string, left: string, right: string) {
+    status = "diffing…";
+    const [result, leftBuf, rightBuf] = await Promise.all([
+      invoke<OpenPairResult>("open_file_pair", { tabId: id, left, right }),
+      invoke<ArrayBuffer>("open_file_text", { path: left }),
+      invoke<ArrayBuffer>("open_file_text", { path: right }),
+    ]);
+
+    const leftText = new TextDecoder().decode(leftBuf);
+    const rightText = new TextDecoder().decode(rightBuf);
+    // Only a fallback for the brief window during construction below where the *other* side's
+    // EditorView doesn't exist yet (its own intra-line highlighter can synchronously schedule
+    // its first fetch from inside `new EditorView(...)`, before this function has assigned
+    // `rightView`/`leftView`) -- not used once both views exist, since `getOtherDoc` below reads
+    // the live view's current document past that point, including edits.
+    const leftDocAtOpen = Text.of(leftText.split("\n"));
+    const rightDocAtOpen = Text.of(rightText.split("\n"));
+
+    const tab = getTab(id);
+    if (!tab) return; // the tab was closed while open_file_pair/open_file_text were in flight
+    const fetchSpans = (leftLine: string, rightLine: string) =>
+      invoke<Span[]>("intra_line_spans", { leftLine, rightLine, ignoreWhitespace: tab.ignoreWhitespace, ignoreCase: tab.ignoreCase });
+    const onFetchError = (message: string) => invoke("report_error", { message: `intra-line(${id}): ${message}` });
+
+    status = "mounting editors…";
+    const leftEl = document.getElementById(`left-pane-${id}`)!;
+    const rightEl = document.getElementById(`right-pane-${id}`)!;
+    let leftView!: EditorView;
+    let rightView!: EditorView;
+    leftView = createDiffEditor(
+      leftEl,
+      leftText,
+      result.diff.hunks,
+      "left",
+      false,
+      { getOtherDoc: () => (rightView ? rightView.state.doc : rightDocAtOpen), fetchSpans, onFetchError },
+      true,
+      true,
+      (deltas) => onEdit(id, "left", deltas),
+    );
+    rightView = createDiffEditor(
+      rightEl,
+      rightText,
+      result.diff.hunks,
+      "right",
+      false,
+      { getOtherDoc: () => (leftView ? leftView.state.doc : leftDocAtOpen), fetchSpans, onFetchError },
+      true,
+      true,
+      (deltas) => onEdit(id, "right", deltas),
+    );
+    syncScroll(leftView, rightView);
+    tabRuntimes.set(id, { leftView, rightView, editQueueLeft: Promise.resolve(), editQueueRight: Promise.resolve(), redoDiffTimer: undefined });
+
+    // Sets changeLines/currentChangeHunks/currentHunk/minimapSegments/totalLines consistently
+    // with every later re-diff, rather than duplicating that logic here -- an earlier version of
+    // this function set changeLines directly but never set currentChangeHunks, which stayed
+    // stale ([]) until the first toggle/edit, making copyCurrentHunk crash on the very first
+    // hunk-copy click before any other re-diff had run. Caught by manual testing under Xvfb,
+    // not by any unit test (none of them exercise this function's real invoke() calls).
+    applyNewHunksFor(id, result.diff.hunks);
+    tab.diffStats = result.diff.stats;
+    leftView.scrollDOM.addEventListener("scroll", () => updateViewportIndicatorFor(id));
+    updateViewportIndicatorFor(id);
+
+    status = "ready";
+    await invoke("report_ready");
+  }
+
+  /**
+   * Opens a new tab for a file pair: allocates a fresh id, pushes a `FileTab` into `tabs`, waits
+   * a tick so its (id-suffixed) pane elements actually exist in the DOM -- `{#each tabs}` doesn't
+   * repaint synchronously on assignment -- then mounts the real editors. Making a tab the active
+   * one immediately (before its editors exist) is deliberate: it un-hides the right `.panes` div
+   * via `class:hidden`, which is what makes `document.getElementById` inside `mountFileTab` find
+   * a laid-out, visible element rather than a `display:none` one CM6 would mis-measure.
+   */
+  async function openFileTab(left: string, right: string) {
+    const id = createTabId();
+    tabs = [...tabs, newFileTab(id, left, right)];
+    activeTabId = id;
+    await tick();
+    await mountFileTab(id, left, right);
+  }
+
+  /**
+   * Closes a tab: guards on that tab's own unsaved changes (not any other tab's), tears down its
+   * `EditorView`s and debounce timer, drops its `tabRuntimes` entry, tells Rust to free its
+   * `EditBuffer`s, and picks a new active tab if the closed one was active. `skipDirtyGuard` is
+   * for callers that already confirmed discard themselves (there are none yet, but mirrors the
+   * `confirmDiscardIfDirty`-then-act split M3 used, in case a future caller needs it).
+   */
+  async function closeTab(id: string, opts: { skipDirtyGuard?: boolean } = {}) {
+    const tab = getTab(id);
+    if (!tab) return;
+    if (!opts.skipDirtyGuard && (tab.dirtyLeft || tab.dirtyRight)) {
+      if (!window.confirm("You have unsaved changes. Discard them and close this tab?")) return;
+    }
+    const rt = tabRuntimes.get(id);
+    rt?.leftView.destroy();
+    rt?.rightView.destroy();
+    if (rt?.redoDiffTimer !== undefined) clearTimeout(rt.redoDiffTimer);
+    tabRuntimes.delete(id);
+    const closedIndex = tabs.findIndex((t) => t.id === id);
+    tabs = tabs.filter((t) => t.id !== id);
+    invoke("close_tab", { tabId: id });
+    if (activeTabId === id) {
+      activeTabId = tabs.length === 0 ? null : (tabs[Math.min(closedIndex, tabs.length - 1)]?.id ?? tabs[0].id);
+    }
   }
 
   onMount(async () => {
@@ -291,22 +421,24 @@
       invoke("report_error", { message: `unhandledrejection: ${String(e.reason)}` });
     });
     window.addEventListener("keydown", (e) => {
-      if (!isRealFileMode) return;
+      if (!activeTabId) return;
+      const rt = tabRuntimes.get(activeTabId);
+      if (!rt) return;
       if (e.altKey) {
         if (e.key === "ArrowDown") {
           e.preventDefault();
-          goToHunk(1);
+          goToHunk(activeTabId, 1);
         } else if (e.key === "ArrowUp") {
           e.preventDefault();
-          goToHunk(-1);
+          goToHunk(activeTabId, -1);
         }
         return;
       }
       // Cmd+S on macOS, Ctrl+S elsewhere -- saves whichever pane currently has focus.
       if ((e.metaKey || e.ctrlKey) && e.key === "s") {
         e.preventDefault();
-        if (leftView?.hasFocus) saveSide("left");
-        else if (rightView?.hasFocus) saveSide("right");
+        if (rt.leftView.hasFocus) saveSide(activeTabId, "left");
+        else if (rt.rightView.hasFocus) saveSide(activeTabId, "right");
       }
     });
     try {
@@ -335,80 +467,16 @@
   });
 
   /**
-   * M1/M2's real entry point: `diffgrid FILE1 FILE2`. Unlike `runSpike`, this never runs the
-   * synthetic scroll benchmark or the `disablePadding` A/B toggle — those are M0
-   * measurement-harness concerns, not part of the real application. M2 adds: both panes
-   * editable, edits forwarded to Rust's `EditBuffer`s, debounced re-diff. M3 adds: this can now
-   * run a *second* time in the same session (opening a row from the directory-compare view),
-   * so it resets any previously-open pair's live state before doing anything else -- callers
-   * that might be discarding unsaved work must have already confirmed that via
-   * `confirmDiscardIfDirty()` before calling this.
+   * M1/M2's real entry point: `diffgrid FILE1 FILE2`. M4: opens the pair as this session's one
+   * tab (no sidebar, since there's no directory root to populate one from) rather than the
+   * module-level singleton view M1-M3 used -- see DECISIONS.md for why a bare file-pair
+   * invocation still ends up going through the same tab machinery a directory session's rows do,
+   * rather than keeping a separate no-tabs code path for this case.
    */
   async function runRealFiles(left: string, right: string) {
-    resetFileViewState();
-    leftPath = left;
-    rightPath = right;
-    status = "diffing…";
-    const [result, leftBuf, rightBuf] = await Promise.all([
-      invoke<OpenPairResult>("open_file_pair", { left, right }),
-      invoke<ArrayBuffer>("open_file_text", { path: left }),
-      invoke<ArrayBuffer>("open_file_text", { path: right }),
-    ]);
-
-    const leftText = new TextDecoder().decode(leftBuf);
-    const rightText = new TextDecoder().decode(rightBuf);
-    // Only a fallback for the brief window during construction below where the *other* side's
-    // EditorView doesn't exist yet (its own intra-line highlighter can synchronously schedule
-    // its first fetch from inside `new EditorView(...)`, before this function has assigned
-    // `rightView`/`leftView`) -- not used once both views exist, since `getOtherDoc` below reads
-    // the live view's current document past that point, including edits.
-    const leftDocAtOpen = Text.of(leftText.split("\n"));
-    const rightDocAtOpen = Text.of(rightText.split("\n"));
-
-    const fetchSpans = (leftLine: string, rightLine: string) =>
-      invoke<Span[]>("intra_line_spans", { leftLine, rightLine, ignoreWhitespace, ignoreCase });
-    const onFetchError = (message: string) => invoke("report_error", { message: `intra-line: ${message}` });
-
-    status = "mounting editors…";
-    const leftEl = document.getElementById("left-pane")!;
-    const rightEl = document.getElementById("right-pane")!;
-    leftView = createDiffEditor(
-      leftEl,
-      leftText,
-      result.diff.hunks,
-      "left",
-      false,
-      { getOtherDoc: () => (rightView ? rightView.state.doc : rightDocAtOpen), fetchSpans, onFetchError },
-      true,
-      true,
-      (deltas) => onEdit("left", deltas),
-    );
-    rightView = createDiffEditor(
-      rightEl,
-      rightText,
-      result.diff.hunks,
-      "right",
-      false,
-      { getOtherDoc: () => (leftView ? leftView.state.doc : leftDocAtOpen), fetchSpans, onFetchError },
-      true,
-      true,
-      (deltas) => onEdit("right", deltas),
-    );
-    syncScroll(leftView, rightView);
-    mode = "files";
-    // Sets changeLines/currentChangeHunks/currentHunk/minimapSegments/totalLines consistently
-    // with every later re-diff, rather than duplicating that logic here -- a prior version of
-    // this function set changeLines directly but never set currentChangeHunks, which stayed
-    // stale ([]) until the first toggle/edit, making copyCurrentHunk crash on the very first
-    // hunk-copy click before any other re-diff had run. Caught by manual testing under Xvfb,
-    // not by any unit test (none of them exercise runRealFiles's real invoke() calls).
-    applyNewHunks(result.diff.hunks);
-    leftView.scrollDOM.addEventListener("scroll", updateViewportIndicator);
-    updateViewportIndicator();
-
-    statLine = `+${result.diff.stats.added} -${result.diff.stats.removed} ${result.diff.stats.chunks} chunks`;
-    status = "ready";
-    await invoke("report_ready");
+    sessionKind = "file";
+    mode = "session";
+    await openFileTab(left, right);
   }
 
   async function runSpike() {
@@ -426,15 +494,14 @@
     const rightText = new TextDecoder().decode(rightBuf);
 
     status = "mounting editors…";
-    const leftEl = document.getElementById("left-pane")!;
-    const rightEl = document.getElementById("right-pane")!;
+    const leftEl = document.getElementById("spike-left-pane")!;
+    const rightEl = document.getElementById("spike-right-pane")!;
     const leftView = createDiffEditor(leftEl, leftText, diff.hunks, "left", flags.disable_padding, undefined, flags.collapse_equal);
     const rightView = createDiffEditor(rightEl, rightText, diff.hunks, "right", flags.disable_padding, undefined, flags.collapse_equal);
     syncScroll(leftView, rightView);
 
     await doubleRaf();
     const paintMs = performance.now() - t0;
-    statLine = `+${diff.stats.added} -${diff.stats.removed} ${diff.stats.chunks} chunks · open-to-first-paint ${paintMs.toFixed(1)}ms`;
     status = "ready";
     await invoke("report_ready");
 
@@ -451,15 +518,18 @@
   /**
    * M3's real entry point for `diffgrid DIR1 DIR2`. Streams `DirEntry` batches from `scan_dirs`
    * over a `Channel` into `dirEntries` as they arrive -- the scan itself is what's incremental
-   * (docs/PLAN.md §3); this just appends whatever shows up, in whatever order it arrives.
+   * (docs/PLAN.md §3); this just appends whatever shows up, in whatever order it arrives. M4:
+   * no longer switches to a full-page table -- the sidebar and any open file tabs coexist in one
+   * layout, per the session-shell mockup (docs/UI/ui-01.png).
    */
   async function runDirCompare(left: string, right: string) {
+    sessionKind = "dir";
     dirLeftRoot = left;
     dirRightRoot = right;
     dirEntries = [];
     dirScanOutcome = null;
     dirScanning = true;
-    mode = "dirs";
+    mode = "session";
     status = "scanning…";
 
     // A large tree streams thousands of small batches. Applying each straight to `dirEntries`
@@ -525,113 +595,182 @@
     return !entry.isDir && !entry.isSymlink && (entry.status === "same" || entry.status === "modified");
   }
 
-  async function openRowAsFilePair(entry: DirEntry) {
-    if (!isOpenable(entry)) return;
-    if (!confirmDiscardIfDirty()) return;
-    await runRealFiles(`${dirLeftRoot}/${entry.path}`, `${dirRightRoot}/${entry.path}`);
+  /**
+   * A single-character prefix conveying status alongside the row's color, per the sidebar's
+   * compact-list scope decision in DECISIONS.md -- color alone isn't accessible/colorblind-safe,
+   * so this is the non-color signal, matching the sigil convention real tools (git status, VS
+   * Code's Source Control view) already use rather than a wordy status column this sidebar's
+   * width can't accommodate alongside the path.
+   */
+  function statusSigil(status: DirEntry["status"]): string {
+    switch (status) {
+      case "modified":
+        return "~";
+      case "leftOnly":
+        return "-";
+      case "rightOnly":
+        return "+";
+      case "typeConflict":
+        return "!";
+      default:
+        return " ";
+    }
   }
 
-  function backToDirList() {
-    if (!confirmDiscardIfDirty()) return;
-    resetFileViewState();
-    mode = "dirs";
-    status = "ready";
+  /**
+   * Opens a row from the sidebar as a tab -- or, if that exact pair is already open, just
+   * switches to its existing tab rather than opening a duplicate. Real IDEs and editors all do
+   * this; without it, clicking the same row twice would silently accumulate duplicate tabs for
+   * the same pair, which is never what a user wants from a tabbed UI.
+   */
+  async function openRowAsFilePair(entry: DirEntry) {
+    if (!isOpenable(entry)) return;
+    const left = `${dirLeftRoot}/${entry.path}`;
+    const right = `${dirRightRoot}/${entry.path}`;
+    const existing = tabs.find((t) => t.leftPath === left && t.rightPath === right);
+    if (existing) {
+      activeTabId = existing.id;
+      return;
+    }
+    await openFileTab(left, right);
   }
 </script>
 
 <main>
   <div class="status">{status}</div>
-  <div class="stat">{statLine}</div>
-  {#if isRealFileMode}
-    <div class="toolbar">
-      {#if dirLeftRoot}
-        <button onclick={backToDirList}>&larr; Back to directory list</button>
-      {/if}
-      <button onclick={() => goToHunk(-1)} disabled={changeLines.length === 0}>&uarr; Prev diff</button>
-      <button onclick={() => goToHunk(1)} disabled={changeLines.length === 0}>&darr; Next diff</button>
-      <span class="hunk-count">{changeLines.length === 0 ? "no changes" : `${currentHunk + 1} / ${changeLines.length}`}</span>
-      <button onclick={() => copyCurrentHunk("rightToLeft")} disabled={currentHunk === -1} title="Copy the current hunk's right-side version to the left">
-        &larr; Copy to left
-      </button>
-      <button onclick={() => copyCurrentHunk("leftToRight")} disabled={currentHunk === -1} title="Copy the current hunk's left-side version to the right">
-        Copy to right &rarr;
-      </button>
-      <label>
-        <input type="checkbox" bind:checked={ignoreWhitespace} onchange={retoggleDiffOptions} />
-        Ignore whitespace
-      </label>
-      <label>
-        <input type="checkbox" bind:checked={ignoreCase} onchange={retoggleDiffOptions} />
-        Ignore case
-      </label>
-      <button onclick={() => saveSide("left")} disabled={!dirtyLeft || savingLeft} title="Save left (Cmd/Ctrl+S while focused)">
-        {dirtyLeft ? "● " : ""}Save left
-      </button>
-      <button onclick={() => saveSide("right")} disabled={!dirtyRight || savingRight} title="Save right (Cmd/Ctrl+S while focused)">
-        {dirtyRight ? "● " : ""}Save right
-      </button>
-    </div>
-  {/if}
-  {#if mode === "dirs"}
-    <div class="toolbar">
-      <button onclick={cancelDirScan} disabled={!dirScanning}>Cancel scan</button>
-      <label>
-        <input type="checkbox" bind:checked={hideIdentical} />
-        Hide identical
-      </label>
-      <span class="hunk-count">
-        {visibleDirEntries.length} of {dirEntries.length} entries shown
-        {dirScanOutcome?.cancelled ? " (cancelled)" : ""}
-      </span>
-    </div>
-    <div class="dir-table-wrap">
-      <table class="dir-table">
-        <thead>
-          <tr>
-            <th>Path</th>
-            <th>Status</th>
-            <th>Size (left)</th>
-            <th>Size (right)</th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each visibleDirEntries as entry (entry.path)}
+  <div class="body">
+    {#if sessionKind === "dir"}
+      <aside class="sidebar">
+        <div class="sidebar-header">SESSION</div>
+        <div class="sidebar-roots">
+          <div class="sidebar-root">{dirLeftRoot}</div>
+          <div class="sidebar-root">{dirRightRoot}</div>
+        </div>
+        <div class="sidebar-toolbar">
+          <button onclick={cancelDirScan} disabled={!dirScanning}>Cancel scan</button>
+          <label>
+            <input type="checkbox" bind:checked={hideIdentical} />
+            Hide identical
+          </label>
+        </div>
+        <div class="sidebar-header">
+          CHANGED FILES · {visibleDirEntries.length}
+          {dirScanOutcome?.cancelled ? " (cancelled)" : ""}
+        </div>
+        <div class="dir-table-wrap">
+          <table class="dir-table">
+            <tbody>
+              {#each visibleDirEntries as entry (entry.path)}
+                <!-- svelte-ignore a11y_click_events_have_key_events -->
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <tr class="status-{entry.status}" class:openable={isOpenable(entry)} onclick={() => openRowAsFilePair(entry)}>
+                  <td class="sigil">{statusSigil(entry.status)}</td>
+                  <td>{entry.path}{entry.isDir ? "/" : ""}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      </aside>
+    {/if}
+    <div class="main-area">
+      {#if tabs.length > 0}
+        <div class="tab-bar">
+          {#each tabs as tab (tab.id)}
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <tr class="status-{entry.status}" class:openable={isOpenable(entry)} onclick={() => openRowAsFilePair(entry)}>
-              <td>{entry.path}{entry.isDir ? "/" : ""}</td>
-              <td>{entry.status}</td>
-              <td>{entry.sizeLeft ?? ""}</td>
-              <td>{entry.sizeRight ?? ""}</td>
-            </tr>
+            <div class="tab" class:active={tab.id === activeTabId} onclick={() => (activeTabId = tab.id)}>
+              <span class="tab-label">{tab.dirtyLeft || tab.dirtyRight ? "● " : ""}{tab.label}</span>
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <span class="tab-close" onclick={(e) => { e.stopPropagation(); closeTab(tab.id); }} title="Close tab">&times;</span>
+            </div>
           {/each}
-        </tbody>
-      </table>
-    </div>
-  {/if}
-  <!-- Always mounted, even outside file-pair mode: runRealFiles/runSpike look these elements up
-       by id synchronously when they start, and switching `mode` doesn't repaint the DOM until
-       the next tick -- removing this from the DOM under an {#if} would make the very first
-       file pair opened from a directory-scan row (mode: "dirs" -> "files") a race against
-       Svelte's own reactivity. Hidden via CSS instead, which doesn't affect DOM queries. -->
-  <div class="panes" class:hidden={mode === "dirs"}>
-    <div id="left-pane" class="pane"></div>
-    <div id="right-pane" class="pane"></div>
-    {#if isRealFileMode}
-      <!-- Supplementary pointing-device shortcut to the same navigation the Prev/Next diff
-           buttons and Alt+Up/Down already provide with full keyboard access. A click here
-           means "jump to the line at this Y position," which has no meaningful keyboard
-           equivalent (unlike a real interactive control) -- deliberately not keyboard-operable
-           itself, since the same destinations are already reachable by keyboard elsewhere. -->
-      <!-- svelte-ignore a11y_click_events_have_key_events -->
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div class="minimap" onclick={onMinimapClick} title="Click to jump to a position in the file">
-        {#each minimapSegments as seg}
-          <div class="minimap-segment minimap-{seg.kind}" style="top: {seg.startFrac * 100}%; height: {seg.lenFrac * 100}%;"></div>
-        {/each}
-        <div class="minimap-viewport" style="top: {viewportIndicator.topFrac * 100}%; height: {viewportIndicator.heightFrac * 100}%;"></div>
+        </div>
+      {/if}
+      {#if activeTab}
+        <div class="toolbar">
+          <button onclick={() => goToHunk(activeTab.id, -1)} disabled={activeTab.changeLines.length === 0}>&uarr; Prev diff</button>
+          <button onclick={() => goToHunk(activeTab.id, 1)} disabled={activeTab.changeLines.length === 0}>&darr; Next diff</button>
+          <span class="hunk-count">
+            {activeTab.changeLines.length === 0 ? "no changes" : `${activeTab.currentHunk + 1} / ${activeTab.changeLines.length}`}
+          </span>
+          <button
+            onclick={() => copyCurrentHunk(activeTab.id, "rightToLeft")}
+            disabled={activeTab.currentHunk === -1}
+            title="Copy the current hunk's right-side version to the left"
+          >
+            &larr; Copy to left
+          </button>
+          <button
+            onclick={() => copyCurrentHunk(activeTab.id, "leftToRight")}
+            disabled={activeTab.currentHunk === -1}
+            title="Copy the current hunk's left-side version to the right"
+          >
+            Copy to right &rarr;
+          </button>
+          <label>
+            <input type="checkbox" bind:checked={activeTab.ignoreWhitespace} onchange={() => retoggleDiffOptions(activeTab.id)} />
+            Ignore whitespace
+          </label>
+          <label>
+            <input type="checkbox" bind:checked={activeTab.ignoreCase} onchange={() => retoggleDiffOptions(activeTab.id)} />
+            Ignore case
+          </label>
+          <button
+            onclick={() => saveSide(activeTab.id, "left")}
+            disabled={!activeTab.dirtyLeft || activeTab.savingLeft}
+            title="Save left (Cmd/Ctrl+S while focused)"
+          >
+            {activeTab.dirtyLeft ? "● " : ""}Save left
+          </button>
+          <button
+            onclick={() => saveSide(activeTab.id, "right")}
+            disabled={!activeTab.dirtyRight || activeTab.savingRight}
+            title="Save right (Cmd/Ctrl+S while focused)"
+          >
+            {activeTab.dirtyRight ? "● " : ""}Save right
+          </button>
+          {#if activeTab.diffStats}
+            <span class="stat">+{activeTab.diffStats.added} -{activeTab.diffStats.removed} {activeTab.diffStats.chunks} chunks</span>
+          {/if}
+        </div>
+      {/if}
+      <!-- Every open tab's panes stay mounted (hidden via CSS when inactive), not just the active
+           one's: `mountFileTab` looks its pane elements up by id synchronously, and a tab that's
+           never been the active one yet would otherwise never have laid-out (non-display:none)
+           elements for CM6 to measure. This also means switching tabs is a pure visibility
+           toggle -- scroll position, undo history, and everything else CM6 tracks survive it. -->
+      {#each tabs as tab (tab.id)}
+        <div class="panes" class:hidden={tab.id !== activeTabId}>
+          <div id="left-pane-{tab.id}" class="pane"></div>
+          <div id="right-pane-{tab.id}" class="pane"></div>
+          <!-- Supplementary pointing-device shortcut to the same navigation the Prev/Next diff
+               buttons and Alt+Up/Down already provide with full keyboard access. A click here
+               means "jump to the line at this Y position," which has no meaningful keyboard
+               equivalent (unlike a real interactive control) -- deliberately not keyboard-operable
+               itself, since the same destinations are already reachable by keyboard elsewhere. -->
+          <!-- svelte-ignore a11y_click_events_have_key_events -->
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div class="minimap" onclick={(e) => onMinimapClick(tab.id, e)} title="Click to jump to a position in the file">
+            {#each tab.minimapSegments as seg}
+              <div class="minimap-segment minimap-{seg.kind}" style="top: {seg.startFrac * 100}%; height: {seg.lenFrac * 100}%;"></div>
+            {/each}
+            <div class="minimap-viewport" style="top: {tab.viewportIndicator.topFrac * 100}%; height: {tab.viewportIndicator.heightFrac * 100}%;"></div>
+          </div>
+        </div>
+      {/each}
+      {#if sessionKind === "dir" && tabs.length === 0}
+        <div class="empty-state">Select a file from the sidebar to compare it.</div>
+      {/if}
+      <!-- M0's benchmark flow only -- always mounted (same DOM-query-timing reasoning as the
+           per-tab panes above), hidden via CSS outside "spike" mode. Uses its own element ids,
+           entirely separate from the per-tab ones, so the two flows can never collide. -->
+      <div class="panes" class:hidden={mode !== "spike"}>
+        <div id="spike-left-pane" class="pane"></div>
+        <div id="spike-right-pane" class="pane"></div>
       </div>
-    {/if}
+    </div>
   </div>
 </main>
 
@@ -647,17 +786,93 @@
     height: 100vh;
     font-family: ui-monospace, Menlo, monospace;
   }
-  .status,
-  .stat {
+  .status {
     flex: 0 0 auto;
     padding: 4px 8px;
     font-size: 12px;
     background: #222;
     color: #ddd;
   }
+  .body {
+    flex: 1 1 auto;
+    display: flex;
+    min-height: 0;
+  }
+  .sidebar {
+    flex: 0 0 260px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background: #fafafa;
+    border-right: 1px solid #ddd;
+    font-size: 12px;
+  }
+  .sidebar-header {
+    padding: 6px 8px;
+    font-weight: bold;
+    color: #666;
+    background: #f0f0f0;
+  }
+  .sidebar-roots {
+    padding: 4px 8px;
+  }
+  .sidebar-root {
+    color: #333;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sidebar-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+  }
+  .sidebar-toolbar label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+  }
+  .main-area {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+  }
+  .tab-bar {
+    flex: 0 0 auto;
+    display: flex;
+    background: #222;
+    overflow-x: auto;
+  }
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: #aaa;
+    border-right: 1px solid #333;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .tab.active {
+    color: #fff;
+    background: #333;
+  }
+  .tab-close {
+    color: #888;
+    padding: 0 2px;
+  }
+  .tab-close:hover {
+    color: #fff;
+  }
   .toolbar {
     flex: 0 0 auto;
     display: flex;
+    align-items: center;
     gap: 16px;
     padding: 4px 8px;
     font-size: 12px;
@@ -670,7 +885,8 @@
     gap: 4px;
     cursor: pointer;
   }
-  .toolbar button {
+  .toolbar button,
+  .sidebar-toolbar button {
     font-size: 12px;
     background: #444;
     color: #ddd;
@@ -679,12 +895,26 @@
     padding: 2px 6px;
     cursor: pointer;
   }
+  .sidebar-toolbar button {
+    background: #eee;
+    color: #333;
+    border-color: #ccc;
+  }
   .toolbar button:disabled {
     opacity: 0.4;
     cursor: default;
   }
-  .hunk-count {
+  .hunk-count,
+  .toolbar .stat {
     color: #999;
+  }
+  .empty-state {
+    flex: 1 1 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #999;
+    font-size: 13px;
   }
   .panes {
     flex: 1 1 auto;
@@ -735,23 +965,32 @@
     flex: 1 1 auto;
     min-height: 0;
     overflow: auto;
+    background: #fafafa;
   }
   .dir-table {
     width: 100%;
     border-collapse: collapse;
     font-size: 12px;
   }
-  .dir-table th,
+  .dir-table tr {
+    /* WebKit has a long-standing bug rendering :focus outlines on display:table-row elements
+       as a large filled block instead of a thin border -- reproduced here (not hypothetical)
+       under Xvfb/WebKitGTK after clicking a row, since a clicked element becomes focusable.
+       See PLATFORM_NOTES.md. */
+    outline: none;
+  }
   .dir-table td {
     text-align: left;
     padding: 3px 8px;
     border-bottom: 1px solid #eee;
+    overflow: hidden;
+    text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .dir-table th {
-    position: sticky;
-    top: 0;
-    background: #f5f5f5;
+  .dir-table td.sigil {
+    width: 1em;
+    padding-right: 0;
+    font-weight: bold;
   }
   .dir-table tr.openable {
     cursor: pointer;
