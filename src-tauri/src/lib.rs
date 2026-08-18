@@ -106,6 +106,15 @@ fn intra_line_spans(left_line: String, right_line: String) -> Vec<diff_core::Spa
     diff_core::intra_line_spans(&left_line, &right_line)
 }
 
+/// Re-diffs two already-loaded, already-normalized texts with whitespace/case-ignore toggles
+/// applied, per docs/PLAN.md's M1 feature list. Takes text rather than a path so a toggle
+/// change doesn't re-read the file from disk — the frontend already has both texts in memory
+/// from `open_file_pair`/`open_file_text` at open time.
+#[tauri::command]
+fn diff_texts(left: String, right: String, ignore_whitespace: bool, ignore_case: bool) -> diff_core::FileDiffResult {
+    diff_core::diff_lines_with_options(&left, &right, diff_core::DiffOptions { ignore_whitespace, ignore_case })
+}
+
 /// Argv (excluding argv[0]) as handed to the process. `diffgrid FILE1 FILE2` is M1's real
 /// entry point; the frontend falls back to the M0 fixture-benchmark flow when this is empty,
 /// which is exactly how `bench/m0-spike.mjs` invokes the binary today (no arguments).
@@ -186,7 +195,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             diff_fixture, fixture_text, report_ready, report_bench, report_error, bench_flags,
-            open_file_pair, open_file_text, launch_args, intra_line_spans
+            open_file_pair, open_file_text, launch_args, intra_line_spans, diff_texts
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

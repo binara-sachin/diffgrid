@@ -2,7 +2,8 @@
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { Text } from "@codemirror/state";
-  import { createDiffEditor, syncScroll, runScrollBenchmark } from "$lib/diffView";
+  import type { EditorView } from "@codemirror/view";
+  import { createDiffEditor, syncScroll, updateHunks, runScrollBenchmark } from "$lib/diffView";
   import type { FileDiffResult, OpenPairResult, Span } from "$lib/types";
 
   const FIXTURE = "100k-line-pair";
@@ -11,6 +12,31 @@
 
   let status = $state("loading…");
   let statLine = $state("");
+  let isRealFileMode = $state(false);
+  let ignoreWhitespace = $state(false);
+  let ignoreCase = $state(false);
+
+  // Populated by runRealFiles; read by retoggleDiffOptions. Not reactive state -- these never
+  // change independently of a full re-open, so plain module-scoped variables are enough.
+  let leftView: EditorView | undefined;
+  let rightView: EditorView | undefined;
+  let leftText = "";
+  let rightText = "";
+
+  async function retoggleDiffOptions() {
+    if (!leftView || !rightView) return;
+    status = "re-diffing…";
+    const diff = await invoke<FileDiffResult>("diff_texts", {
+      left: leftText,
+      right: rightText,
+      ignoreWhitespace,
+      ignoreCase,
+    });
+    updateHunks(leftView, diff.hunks);
+    updateHunks(rightView, diff.hunks);
+    statLine = `+${diff.stats.added} -${diff.stats.removed} ${diff.stats.chunks} chunks`;
+    status = "ready";
+  }
 
   function doubleRaf(): Promise<void> {
     return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
@@ -50,8 +76,8 @@
       invoke<ArrayBuffer>("open_file_text", { path: right }),
     ]);
 
-    const leftText = new TextDecoder().decode(leftBuf);
-    const rightText = new TextDecoder().decode(rightBuf);
+    leftText = new TextDecoder().decode(leftBuf);
+    rightText = new TextDecoder().decode(rightBuf);
     const leftDoc = Text.of(leftText.split("\n"));
     const rightDoc = Text.of(rightText.split("\n"));
 
@@ -62,7 +88,7 @@
     status = "mounting editors…";
     const leftEl = document.getElementById("left-pane")!;
     const rightEl = document.getElementById("right-pane")!;
-    const leftView = createDiffEditor(
+    leftView = createDiffEditor(
       leftEl,
       leftText,
       result.diff.hunks,
@@ -71,7 +97,7 @@
       { otherDoc: rightDoc, fetchSpans, onFetchError },
       true,
     );
-    const rightView = createDiffEditor(
+    rightView = createDiffEditor(
       rightEl,
       rightText,
       result.diff.hunks,
@@ -81,6 +107,7 @@
       true,
     );
     syncScroll(leftView, rightView);
+    isRealFileMode = true;
 
     statLine = `+${result.diff.stats.added} -${result.diff.stats.removed} ${result.diff.stats.chunks} chunks`;
     status = "ready";
@@ -127,6 +154,18 @@
 <main>
   <div class="status">{status}</div>
   <div class="stat">{statLine}</div>
+  {#if isRealFileMode}
+    <div class="toolbar">
+      <label>
+        <input type="checkbox" bind:checked={ignoreWhitespace} onchange={retoggleDiffOptions} />
+        Ignore whitespace
+      </label>
+      <label>
+        <input type="checkbox" bind:checked={ignoreCase} onchange={retoggleDiffOptions} />
+        Ignore case
+      </label>
+    </div>
+  {/if}
   <div class="panes">
     <div id="left-pane" class="pane"></div>
     <div id="right-pane" class="pane"></div>
@@ -152,6 +191,21 @@
     font-size: 12px;
     background: #222;
     color: #ddd;
+  }
+  .toolbar {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 16px;
+    padding: 4px 8px;
+    font-size: 12px;
+    background: #333;
+    color: #ddd;
+  }
+  .toolbar label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
   }
   .panes {
     flex: 1 1 auto;
