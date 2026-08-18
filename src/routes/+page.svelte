@@ -437,9 +437,14 @@
   }
 
   onMount(async () => {
-    // The settings window emits this after every successful save (src-tauri's save_settings)
-    // so the main window's already-loaded `settings` (and any already-open tab's *global-only*
-    // fields, since those have no per-tab override to protect) stay in sync without polling.
+    // The settings window emits this after every successful save (src-tauri's save_settings) so
+    // the main window's already-loaded `settings` stays in sync without polling. This only
+    // updates the value new tabs will be mounted with -- it deliberately does NOT remount
+    // already-open tabs' collapse-lines/intra-line-mode, since CM6 panes are managed
+    // imperatively (see this file's own architecture note) and rebuilding a live EditorView's
+    // extensions out from under an in-progress edit is exactly the kind of state-sync bug that
+    // approach exists to avoid -- new tabs opened after this fires pick up the new value via
+    // `mountFileTab`'s reads of `settings`.
     listen<Settings>("settings-changed", (event) => {
       settings = event.payload;
     });

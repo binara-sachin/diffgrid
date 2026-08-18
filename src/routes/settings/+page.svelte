@@ -12,14 +12,14 @@
   let loaded = $state(false);
 
   onMount(async () => {
-    settings = await invoke<Settings>("load_settings");
-    loaded = true;
     window.addEventListener("error", (e) => {
       invoke("report_error", { message: `settings window.onerror: ${e.message}` });
     });
     window.addEventListener("unhandledrejection", (e) => {
       invoke("report_error", { message: `settings unhandledrejection: ${String(e.reason)}` });
     });
+    settings = await invoke<Settings>("load_settings");
+    loaded = true;
   });
 
   // Persists on every change (no explicit Save button, matching the mockup's live-toggle
