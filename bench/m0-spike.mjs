@@ -16,10 +16,14 @@
 // uniformly since both GNU ps (Linux) and BSD ps (macOS) support the same
 // `-o pid=,ppid=,rss=` output form. See PLATFORM_NOTES.md.
 //
-// Usage: node bench/m0-spike.mjs [iterations] [--disable-padding]
+// Usage: node bench/m0-spike.mjs [iterations] [--disable-padding] [--collapse-equal]
 //   --disable-padding sets DIFFGRID_DISABLE_PADDING=1 for the app, an A/B toggle to test
 //   whether alignment-padding block widgets are the source of the scroll-onset stall,
 //   rather than asserting that cause without testing it.
+//   --collapse-equal sets DIFFGRID_COLLAPSE_EQUAL=1, a probe (not yet a shipped feature, see
+//   DECISIONS.md) for whether Decoration.replace({block:true}) -- the only CM6 mechanism for
+//   collapsing unchanged regions -- costs what the padding block widgets did before they were
+//   fixed.
 
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -31,6 +35,7 @@ const REPO_ROOT = path.resolve(__dirname, "..");
 const BIN_PATH = path.join(REPO_ROOT, "target/release/app");
 const ITERATIONS = parseInt(process.argv[2] ?? "5", 10);
 const DISABLE_PADDING = process.argv.includes("--disable-padding");
+const COLLAPSE_EQUAL = process.argv.includes("--collapse-equal");
 const READY_TIMEOUT_MS = 20_000;
 const BENCH_TIMEOUT_MS = 15_000;
 const MEMORY_SAMPLE_DELAY_MS = 1200; // after READY, before the app's own scroll bench starts
@@ -103,6 +108,7 @@ async function runOnce(env) {
     const t0 = performance.now();
     const spawnEnv = { ...process.env, ...env };
     if (DISABLE_PADDING) spawnEnv.DIFFGRID_DISABLE_PADDING = "1";
+    if (COLLAPSE_EQUAL) spawnEnv.DIFFGRID_COLLAPSE_EQUAL = "1";
     const child = spawn(BIN_PATH, [], { env: spawnEnv });
 
     let readyMs = null;
@@ -176,7 +182,7 @@ function memoryPressureLine() {
 async function main() {
   const { env, xvfb } = await ensureDisplay();
   console.log(
-    `platform=${process.platform} display-managed=${xvfb !== null} iterations=${ITERATIONS} disablePadding=${DISABLE_PADDING}`,
+    `platform=${process.platform} display-managed=${xvfb !== null} iterations=${ITERATIONS} disablePadding=${DISABLE_PADDING} collapseEqual=${COLLAPSE_EQUAL}`,
   );
   // Idle-memory RSS was observed to vary by ~5x across otherwise-identical runs depending on
   // ambient system memory pressure (see docs/PROFILING.md) — logging this so results can be
@@ -220,7 +226,7 @@ async function main() {
 
   console.log("\n=== M0 spike report ===");
   console.log(memoryPressureLine());
-  console.log(`successful runs: ${runs.length}/${ITERATIONS}, disablePadding=${DISABLE_PADDING}`);
+  console.log(`successful runs: ${runs.length}/${ITERATIONS}, disablePadding=${DISABLE_PADDING} collapseEqual=${COLLAPSE_EQUAL}`);
   console.log(`spawn -> DIFFGRID_READY, decomposed (ms):`);
   console.log(`  total:  mean=${ready.mean.toFixed(1)} p50=${ready.p50.toFixed(1)} p95=${ready.p95.toFixed(1)} max=${ready.max.toFixed(1)}`);
   console.log(`  launch-only (total - in-app paint): mean=${launchOnly.mean.toFixed(1)} p50=${launchOnly.p50.toFixed(1)} max=${launchOnly.max.toFixed(1)}`);

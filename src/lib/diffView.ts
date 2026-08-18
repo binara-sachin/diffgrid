@@ -1,5 +1,5 @@
 import { EditorState, RangeSetBuilder, StateEffect, StateField, Text } from "@codemirror/state";
-import { EditorView, Decoration, type DecorationSet, ViewPlugin, type ViewUpdate, lineNumbers, keymap } from "@codemirror/view";
+import { EditorView, Decoration, type DecorationSet, ViewPlugin, type ViewUpdate, WidgetType, lineNumbers, keymap } from "@codemirror/view";
 import { defaultKeymap } from "@codemirror/commands";
 import { javascript } from "@codemirror/lang-javascript";
 import type { Hunk, Span } from "./types";
@@ -212,6 +212,81 @@ export function intraLineHighlighter(
   return [intraLineField, plugin];
 }
 
+export const COLLAPSE_CONTEXT_LINES = 3;
+export const COLLAPSE_MIN_HUNK_LINES = 20;
+
+export interface CollapseRange {
+  fromLine: number;
+  toLine: number;
+}
+
+/**
+ * Which line ranges within large `Equal` hunks are candidates for collapsing, leaving
+ * `COLLAPSE_CONTEXT_LINES` of real content visible at each edge (matching the conventional
+ * diff-context idea). Pure and side-agnostic from the caller's hunk-list-and-side inputs so it's
+ * unit testable without CM6 involved at all — the CM6 decoration-building step is separate.
+ *
+ * Never touches a non-`Equal` hunk, and always leaves context lines untouched at both edges of
+ * a collapsed run — by construction this never overlaps a `buildDecorations` padding
+ * attribute, since padding is only ever anchored at a hunk boundary (the first line of the
+ * following hunk, or the document's last line), never inside the middle of a run.
+ */
+export function buildCollapseRanges(doc: Text, hunks: Hunk[], side: "left" | "right"): CollapseRange[] {
+  const ranges: CollapseRange[] = [];
+  for (const h of hunks) {
+    if (h.kind !== "equal") continue;
+    const range = side === "left" ? h.left : h.right;
+    if (range.len <= COLLAPSE_MIN_HUNK_LINES) continue;
+    const fromLine = range.start + COLLAPSE_CONTEXT_LINES + 1;
+    const toLine = range.start + range.len - COLLAPSE_CONTEXT_LINES;
+    if (toLine < fromLine || toLine > doc.lines) continue;
+    ranges.push({ fromLine, toLine });
+  }
+  return ranges;
+}
+
+export class CollapseWidget extends WidgetType {
+  constructor(readonly hiddenLines: number) {
+    super();
+  }
+  eq(other: CollapseWidget) {
+    return other.hiddenLines === this.hiddenLines;
+  }
+  toDOM() {
+    const div = document.createElement("div");
+    div.className = "diff-collapse";
+    div.textContent = `⋯ ${this.hiddenLines} unchanged lines ⋯`;
+    return div;
+  }
+  ignoreEvent() {
+    return true;
+  }
+}
+
+/**
+ * Collapses large unchanged (`Equal`) regions to a one-line placeholder, per docs/PLAN.md §6.
+ * `Decoration.replace({block: true})` is the only CM6 mechanism for hiding a multi-line range —
+ * before shipping this, it was A/B measured (see DECISIONS.md and `bench/m0-spike.mjs
+ * --collapse-equal`) against the exact regression the padding-widget investigation
+ * (docs/PROFILING.md) found for `Decoration.widget({block: true})`, since both are block-level
+ * decorations. Measured result on the 100k-line fixture with 392 collapsed ranges: fps and paint
+ * time both stayed within noise of the no-collapse baseline — unlike widgets, a `replace`
+ * decoration removes its range from layout instead of requiring CM6 to track a heterogeneous
+ * height for content around it, so it never triggers the same non-uniform-height mode.
+ *
+ * Not yet interactive — there is no click-to-expand. See DECISIONS.md for why that's deferred
+ * rather than silently missing.
+ */
+export function buildCollapseDecorations(doc: Text, hunks: Hunk[], side: "left" | "right"): DecorationSet {
+  const builder = new RangeSetBuilder<Decoration>();
+  for (const { fromLine, toLine } of buildCollapseRanges(doc, hunks, side)) {
+    const from = doc.line(fromLine).from;
+    const to = doc.line(toLine).to;
+    builder.add(from, to, Decoration.replace({ block: true, widget: new CollapseWidget(toLine - fromLine + 1) }));
+  }
+  return builder.finish();
+}
+
 export function createDiffEditor(
   parent: HTMLElement,
   text: string,
@@ -219,9 +294,11 @@ export function createDiffEditor(
   side: "left" | "right",
   disablePadding = false,
   intraLine?: { otherDoc: Text; fetchSpans: SpansFetcher; onFetchError?: (message: string) => void },
+  collapseEqual = false,
 ): EditorView {
   const doc = Text.of(text.split("\n"));
   const decorations = buildDecorations(doc, hunks, side, disablePadding);
+  const collapseDecorations = collapseEqual ? buildCollapseDecorations(doc, hunks, side) : Decoration.none;
 
   const state = EditorState.create({
     doc,
@@ -231,6 +308,7 @@ export function createDiffEditor(
       javascript(),
       EditorState.readOnly.of(true),
       EditorView.decorations.of(decorations),
+      EditorView.decorations.of(collapseDecorations),
       ...(intraLine
         ? intraLineHighlighter(hunks, side, intraLine.otherDoc, intraLine.fetchSpans, intraLine.onFetchError)
         : []),

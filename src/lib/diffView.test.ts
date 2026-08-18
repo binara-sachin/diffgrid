@@ -1,6 +1,15 @@
 import { describe, it, expect } from "vitest";
 import { Text } from "@codemirror/state";
-import { LINE_HEIGHT_PX, posAfterLine, buildDecorations, replaceLinePairsInRange, spansToMarkRanges } from "./diffView";
+import {
+  LINE_HEIGHT_PX,
+  posAfterLine,
+  buildDecorations,
+  replaceLinePairsInRange,
+  spansToMarkRanges,
+  buildCollapseRanges,
+  COLLAPSE_CONTEXT_LINES,
+  COLLAPSE_MIN_HUNK_LINES,
+} from "./diffView";
 import type { Hunk, Span } from "./types";
 
 describe("posAfterLine", () => {
@@ -163,5 +172,47 @@ describe("spansToMarkRanges", () => {
   it("returns nothing for an out-of-range line number", () => {
     const spans: Span[] = [{ side: "left", startUtf16: 0, lenUtf16: 1 }];
     expect(spansToMarkRanges(spans, doc, 999, "left")).toEqual([]);
+  });
+});
+
+describe("buildCollapseRanges", () => {
+  function doc(lines: number) {
+    return Text.of(Array.from({ length: lines }, (_, i) => `line${i + 1}`));
+  }
+  const bigLen = COLLAPSE_MIN_HUNK_LINES + 10;
+
+  it("never collapses a hunk at or below the minimum size", () => {
+    const hunks: Hunk[] = [{ kind: "equal", left: { start: 0, len: COLLAPSE_MIN_HUNK_LINES }, right: { start: 0, len: COLLAPSE_MIN_HUNK_LINES } }];
+    expect(buildCollapseRanges(doc(COLLAPSE_MIN_HUNK_LINES), hunks, "left")).toEqual([]);
+  });
+
+  it("collapses a large equal hunk, leaving context lines visible on both edges", () => {
+    const hunks: Hunk[] = [{ kind: "equal", left: { start: 0, len: bigLen }, right: { start: 0, len: bigLen } }];
+    const ranges = buildCollapseRanges(doc(bigLen), hunks, "left");
+    expect(ranges).toEqual([{ fromLine: COLLAPSE_CONTEXT_LINES + 1, toLine: bigLen - COLLAPSE_CONTEXT_LINES }]);
+  });
+
+  it("never collapses a non-equal hunk regardless of length", () => {
+    const hunks: Hunk[] = [{ kind: "insert", left: { start: 0, len: 0 }, right: { start: 0, len: bigLen } }];
+    expect(buildCollapseRanges(doc(bigLen), hunks, "right")).toEqual([]);
+  });
+
+  it("produces one independent range per large equal hunk", () => {
+    const hunks: Hunk[] = [
+      { kind: "equal", left: { start: 0, len: bigLen }, right: { start: 0, len: bigLen } },
+      { kind: "replace", left: { start: bigLen, len: 1 }, right: { start: bigLen, len: 1 } },
+      { kind: "equal", left: { start: bigLen + 1, len: bigLen }, right: { start: bigLen + 1, len: bigLen } },
+    ];
+    const totalLines = bigLen * 2 + 1;
+    const ranges = buildCollapseRanges(doc(totalLines), hunks, "left");
+    expect(ranges).toHaveLength(2);
+    expect(ranges[0].fromLine).toBe(COLLAPSE_CONTEXT_LINES + 1);
+    expect(ranges[1].fromLine).toBe(bigLen + 1 + COLLAPSE_CONTEXT_LINES + 1);
+  });
+
+  it("skips a hunk whose collapse range would run past the end of the document", () => {
+    const hunks: Hunk[] = [{ kind: "equal", left: { start: 0, len: bigLen }, right: { start: 0, len: bigLen } }];
+    // doc only has 5 real lines even though the hunk metadata claims bigLen -- defensive
+    expect(buildCollapseRanges(doc(5), hunks, "left")).toEqual([]);
   });
 });

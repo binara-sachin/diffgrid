@@ -62,16 +62,24 @@
     status = "mounting editors…";
     const leftEl = document.getElementById("left-pane")!;
     const rightEl = document.getElementById("right-pane")!;
-    const leftView = createDiffEditor(leftEl, leftText, result.diff.hunks, "left", false, {
-      otherDoc: rightDoc,
-      fetchSpans,
-      onFetchError,
-    });
-    const rightView = createDiffEditor(rightEl, rightText, result.diff.hunks, "right", false, {
-      otherDoc: leftDoc,
-      fetchSpans,
-      onFetchError,
-    });
+    const leftView = createDiffEditor(
+      leftEl,
+      leftText,
+      result.diff.hunks,
+      "left",
+      false,
+      { otherDoc: rightDoc, fetchSpans, onFetchError },
+      true,
+    );
+    const rightView = createDiffEditor(
+      rightEl,
+      rightText,
+      result.diff.hunks,
+      "right",
+      false,
+      { otherDoc: leftDoc, fetchSpans, onFetchError },
+      true,
+    );
     syncScroll(leftView, rightView);
 
     statLine = `+${result.diff.stats.added} -${result.diff.stats.removed} ${result.diff.stats.chunks} chunks`;
@@ -83,7 +91,7 @@
     const t0 = performance.now();
 
     const [flags, diff, leftBuf, rightBuf] = await Promise.all([
-      invoke<{ disable_padding: boolean }>("bench_flags"),
+      invoke<{ disable_padding: boolean; collapse_equal: boolean }>("bench_flags"),
       invoke<FileDiffResult>("diff_fixture", { name: FIXTURE }),
       invoke<ArrayBuffer>("fixture_text", { name: FIXTURE, side: "left" }),
       invoke<ArrayBuffer>("fixture_text", { name: FIXTURE, side: "right" }),
@@ -95,8 +103,8 @@
     status = "mounting editors…";
     const leftEl = document.getElementById("left-pane")!;
     const rightEl = document.getElementById("right-pane")!;
-    const leftView = createDiffEditor(leftEl, leftText, diff.hunks, "left", flags.disable_padding);
-    const rightView = createDiffEditor(rightEl, rightText, diff.hunks, "right", flags.disable_padding);
+    const leftView = createDiffEditor(leftEl, leftText, diff.hunks, "left", flags.disable_padding, undefined, flags.collapse_equal);
+    const rightView = createDiffEditor(rightEl, rightText, diff.hunks, "right", flags.disable_padding, undefined, flags.collapse_equal);
     syncScroll(leftView, rightView);
 
     await doubleRaf();
@@ -109,7 +117,9 @@
       status = "running scroll benchmark…";
       const stats = await runScrollBenchmark(leftView, SCROLL_BENCH_DURATION_MS);
       status = `scroll bench: ${stats.steadyEstimatedFps.toFixed(1)} fps (steady mean), first-scroll-frame ${stats.firstScrollFrameMs.toFixed(1)}ms`;
-      await invoke("report_bench", { json: JSON.stringify({ paintMs, disablePadding: flags.disable_padding, ...stats }) });
+      await invoke("report_bench", {
+        json: JSON.stringify({ paintMs, disablePadding: flags.disable_padding, collapseEqual: flags.collapse_equal, ...stats }),
+      });
     }, SCROLL_BENCH_DELAY_MS);
   }
 </script>
@@ -166,6 +176,15 @@
   :global(.diff-intra) {
     background-color: rgba(210, 153, 34, 0.55);
     border-radius: 2px;
+  }
+  :global(.diff-collapse) {
+    padding: 2px 8px;
+    background: #eee;
+    color: #666;
+    font-style: italic;
+    font-size: 12px;
+    border-top: 1px solid #ddd;
+    border-bottom: 1px solid #ddd;
   }
   :global(.diff-pad) {
     background: repeating-linear-gradient(
