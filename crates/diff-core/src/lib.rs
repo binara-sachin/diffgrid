@@ -151,6 +151,42 @@ pub fn diff_lines(left: &str, right: &str) -> FileDiffResult {
     FileDiffResult { hunks, stats }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiffOptions {
+    pub ignore_whitespace: bool,
+    pub ignore_case: bool,
+}
+
+fn normalize_line(line: &str, opts: DiffOptions) -> String {
+    let mut s: std::borrow::Cow<str> = line.into();
+    if opts.ignore_case {
+        s = s.to_lowercase().into();
+    }
+    if opts.ignore_whitespace {
+        s = s.split_whitespace().collect::<Vec<_>>().join(" ").into();
+    }
+    s.into_owned()
+}
+
+/// Splitting and rejoining on `'\n'` reconstructs the exact original newline structure
+/// (including a trailing newline, since `"a\n".split('\n')` yields `["a", ""]` and normalizing
+/// the empty trailing piece is a no-op) — so this can never change the line count `diff_lines`
+/// sees, which is what lets `Hunk` ranges computed against the normalized text stay valid
+/// indices into the caller's original, un-normalized text.
+fn normalize_for_compare(text: &str, opts: DiffOptions) -> String {
+    if !opts.ignore_whitespace && !opts.ignore_case {
+        return text.to_string();
+    }
+    text.split('\n').map(|line| normalize_line(line, opts)).collect::<Vec<_>>().join("\n")
+}
+
+/// Whitespace/case-ignore toggle per docs/PLAN.md's M1 feature list. Normalizes each line for
+/// *comparison only* — the returned hunks index into the caller's original text unchanged,
+/// since normalization never adds or removes a line (see `normalize_for_compare`).
+pub fn diff_lines_with_options(left: &str, right: &str, opts: DiffOptions) -> FileDiffResult {
+    diff_lines(&normalize_for_compare(left, opts), &normalize_for_compare(right, opts))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +405,74 @@ mod tests {
                 Span { side: Side::Right, start_utf16: prefix_units, len_utf16: 1 },
             ]
         );
+    }
+
+    #[test]
+    fn default_options_match_diff_lines_exactly() {
+        let opts = DiffOptions::default();
+        let a = diff_lines_with_options("a\nb\nc\n", "a\nx\nc\n", opts);
+        let b = diff_lines("a\nb\nc\n", "a\nx\nc\n");
+        assert_eq!(a.stats.chunks, b.stats.chunks);
+        assert_eq!(a.hunks.len(), b.hunks.len());
+    }
+
+    #[test]
+    fn ignore_whitespace_treats_a_reindented_line_as_unchanged() {
+        let opts = DiffOptions { ignore_whitespace: true, ignore_case: false };
+        let result = diff_lines_with_options("a\n  foo   bar\nc\n", "a\nfoo bar\nc\n", opts);
+        assert_eq!(result.stats.chunks, 0, "whitespace-only difference should not be a hunk");
+    }
+
+    #[test]
+    fn without_the_toggle_the_same_whitespace_difference_is_a_real_hunk() {
+        let opts = DiffOptions::default();
+        let result = diff_lines_with_options("a\n  foo   bar\nc\n", "a\nfoo bar\nc\n", opts);
+        assert_eq!(result.stats.chunks, 1);
+    }
+
+    #[test]
+    fn ignore_case_treats_a_recased_line_as_unchanged() {
+        let opts = DiffOptions { ignore_whitespace: false, ignore_case: true };
+        let result = diff_lines_with_options("a\nHello World\nc\n", "a\nhello world\nc\n", opts);
+        assert_eq!(result.stats.chunks, 0);
+    }
+
+    #[test]
+    fn combining_both_toggles_handles_a_line_that_differs_in_both_dimensions() {
+        let opts = DiffOptions { ignore_whitespace: true, ignore_case: true };
+        let result = diff_lines_with_options("a\n  Hello   World\nc\n", "a\nhello world\nc\n", opts);
+        assert_eq!(result.stats.chunks, 0);
+    }
+
+    #[test]
+    fn ignoring_whitespace_does_not_hide_a_real_content_difference_elsewhere() {
+        let opts = DiffOptions { ignore_whitespace: true, ignore_case: false };
+        let result = diff_lines_with_options("a\n  foo   bar\nc\n", "a\nfoo bar\nCHANGED\n", opts);
+        assert_eq!(result.stats.chunks, 1, "the real change on line 3 must still be detected");
+        let replace = result.hunks.iter().find(|h| h.kind == HunkKind::Replace).unwrap();
+        assert_eq!(replace.left.start, 2); // line 3, zero-indexed -- the whitespace-only line 2 stayed equal
+    }
+
+    #[test]
+    fn hunk_ranges_still_index_into_the_original_unnormalized_text() {
+        // regression guard: a bug here would be a silent off-by-N in every hunk position,
+        // not a panic, so pin the exact ranges rather than just stats.chunks.
+        let opts = DiffOptions { ignore_whitespace: true, ignore_case: false };
+        let left = "a\n  spaced  out  \nc\nd\n";
+        let right = "a\nspaced out\nc\nDIFFERENT\n";
+        let result = diff_lines_with_options(left, right, opts);
+        let replace = result.hunks.iter().find(|h| h.kind == HunkKind::Replace).unwrap();
+        assert_eq!(replace.left, LineRange { start: 3, len: 1 });
+        assert_eq!(replace.right, LineRange { start: 3, len: 1 });
+    }
+
+    #[test]
+    fn normalize_for_compare_preserves_trailing_newline_presence() {
+        let opts = DiffOptions { ignore_whitespace: true, ignore_case: true };
+        // identical content, one with a trailing newline and one without -- must still be
+        // seen as a changed last line, exactly like the plain diff_lines behavior it wraps.
+        let result = diff_lines_with_options("a\nb\nc", "a\nb\nc\n", opts);
+        let non_equal: Vec<_> = result.hunks.iter().filter(|h| h.kind != HunkKind::Equal).collect();
+        assert_eq!(non_equal.len(), 1);
     }
 }
