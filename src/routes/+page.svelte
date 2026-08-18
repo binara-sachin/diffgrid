@@ -9,18 +9,20 @@
     updateHunks,
     runScrollBenchmark,
     changeHunkLines,
+    changeHunks,
     nextHunkIndex,
     prevHunkIndex,
     scrollToLine,
     computeMinimapSegments,
     computeViewportIndicator,
     minimapClickToLine,
+    buildHunkCopyChange,
     type ChangeHunkLine,
     type MinimapSegment,
     type ViewportIndicator,
     type EditDelta,
   } from "$lib/diffView";
-  import type { FileDiffResult, OpenPairResult, Span } from "$lib/types";
+  import type { FileDiffResult, Hunk, OpenPairResult, Span } from "$lib/types";
 
   const FIXTURE = "100k-line-pair";
   const SCROLL_BENCH_DELAY_MS = 2000;
@@ -52,6 +54,10 @@
   let leftView: EditorView | undefined;
   let rightView: EditorView | undefined;
   let changeLines: ChangeHunkLine[] = $state([]);
+  // Parallel to changeLines (same filter, same order -- see changeHunks), kept separately
+  // because copyCurrentHunk needs the full Hunk (kind + both LineRanges), which
+  // ChangeHunkLine's two bare line numbers don't carry.
+  let currentChangeHunks: Hunk[] = [];
   let currentHunk = $state(-1);
   let minimapSegments: MinimapSegment[] = $state([]);
   let viewportIndicator: ViewportIndicator = $state({ topFrac: 0, heightFrac: 1 });
@@ -72,6 +78,12 @@
     updateHunks(leftView, hunks);
     updateHunks(rightView, hunks);
     changeLines = changeHunkLines(hunks);
+    currentChangeHunks = changeHunks(hunks);
+    // Deliberately reset rather than trying to re-point at "the same" hunk post-copy: a copy
+    // changes the hunk list (the copied hunk usually disappears, and every hunk after it can
+    // shift), the same as any other hunks-invalidating event (a toggle, another edit) already
+    // does. Consistent behavior across all of those beats trying to preserve a selection that
+    // may no longer refer to anything meaningful.
     currentHunk = -1;
     // Refreshed here, not just at open: an edit can add or remove lines, so a re-diff's hunk
     // list may no longer match the line count the minimap was last computed against.
@@ -181,6 +193,22 @@
     scrollToLine(leftView, changeLines[currentHunk].left);
   }
 
+  /**
+   * "Apply/revert individual hunks left↔right" (docs/PLAN.md M2), scoped to the
+   * currently-navigated hunk via the existing Prev/Next diff controls rather than per-hunk
+   * inline gutter buttons -- see DECISIONS.md. Dispatches the copy as a normal CM6 transaction
+   * on the destination view, so it flows through the exact same onEdit → apply_edit →
+   * debounced redo_diff pipeline a keystroke would, with no separate backend command.
+   */
+  function copyCurrentHunk(direction: "leftToRight" | "rightToLeft") {
+    if (!leftView || !rightView || currentHunk === -1) return;
+    const hunk = currentChangeHunks[currentHunk];
+    const change = buildHunkCopyChange(hunk, direction, leftView.state.doc, rightView.state.doc);
+    if (!change) return;
+    const destView = change.destSide === "left" ? leftView : rightView;
+    destView.dispatch({ changes: { from: change.from, to: change.to, insert: change.insert } });
+  }
+
   function doubleRaf(): Promise<void> {
     return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
   }
@@ -282,10 +310,13 @@
     );
     syncScroll(leftView, rightView);
     isRealFileMode = true;
-    totalLines = leftDocAtOpen.lines;
-    changeLines = changeHunkLines(result.diff.hunks);
-    currentHunk = -1;
-    minimapSegments = computeMinimapSegments(result.diff.hunks, totalLines);
+    // Sets changeLines/currentChangeHunks/currentHunk/minimapSegments/totalLines consistently
+    // with every later re-diff, rather than duplicating that logic here -- a prior version of
+    // this function set changeLines directly but never set currentChangeHunks, which stayed
+    // stale ([]) until the first toggle/edit, making copyCurrentHunk crash on the very first
+    // hunk-copy click before any other re-diff had run. Caught by manual testing under Xvfb,
+    // not by any unit test (none of them exercise runRealFiles's real invoke() calls).
+    applyNewHunks(result.diff.hunks);
     leftView.scrollDOM.addEventListener("scroll", updateViewportIndicator);
     updateViewportIndicator();
 
@@ -339,6 +370,12 @@
       <button onclick={() => goToHunk(-1)} disabled={changeLines.length === 0}>&uarr; Prev diff</button>
       <button onclick={() => goToHunk(1)} disabled={changeLines.length === 0}>&darr; Next diff</button>
       <span class="hunk-count">{changeLines.length === 0 ? "no changes" : `${currentHunk + 1} / ${changeLines.length}`}</span>
+      <button onclick={() => copyCurrentHunk("rightToLeft")} disabled={currentHunk === -1} title="Copy the current hunk's right-side version to the left">
+        &larr; Copy to left
+      </button>
+      <button onclick={() => copyCurrentHunk("leftToRight")} disabled={currentHunk === -1} title="Copy the current hunk's left-side version to the right">
+        Copy to right &rarr;
+      </button>
       <label>
         <input type="checkbox" bind:checked={ignoreWhitespace} onchange={retoggleDiffOptions} />
         Ignore whitespace

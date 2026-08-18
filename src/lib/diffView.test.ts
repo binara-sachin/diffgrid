@@ -18,6 +18,8 @@ import {
   computeViewportIndicator,
   minimapClickToLine,
   type EditDelta,
+  buildHunkCopyChange,
+  changeHunks,
 } from "./diffView";
 import type { Hunk, Span } from "./types";
 
@@ -343,6 +345,101 @@ describe("createDiffEditor editable mode / onEdit", () => {
     view.dispatch({ changes: { from: 1, to: 2, insert: "" } });
     expect(captured).toEqual([{ fromUtf16: 1, toUtf16: 2, inserted: "" }]);
     view.destroy();
+  });
+});
+
+describe("changeHunks", () => {
+  it("filters out equal hunks, keeping the full Hunk (not just line numbers)", () => {
+    const hunks: Hunk[] = [
+      { kind: "equal", left: { start: 0, len: 1 }, right: { start: 0, len: 1 } },
+      { kind: "replace", left: { start: 1, len: 1 }, right: { start: 1, len: 1 } },
+    ];
+    expect(changeHunks(hunks)).toEqual([hunks[1]]);
+  });
+});
+
+describe("buildHunkCopyChange", () => {
+  it("returns null for an equal hunk -- nothing to copy", () => {
+    const hunk: Hunk = { kind: "equal", left: { start: 0, len: 1 }, right: { start: 0, len: 1 } };
+    const doc = Text.of(["a"]);
+    expect(buildHunkCopyChange(hunk, "leftToRight", doc, doc)).toBeNull();
+  });
+
+  it("replace, left-to-right: replaces dest's line(s) with source's, including the line's own newline", () => {
+    const leftDoc = Text.of(["a", "b", "c", "d"]);
+    const rightDoc = Text.of(["a", "X", "c", "d"]);
+    const hunk: Hunk = { kind: "replace", left: { start: 1, len: 1 }, right: { start: 1, len: 1 } };
+    const change = buildHunkCopyChange(hunk, "leftToRight", leftDoc, rightDoc)!;
+    expect(change).toEqual({ destSide: "right", from: rightDoc.line(2).from, to: rightDoc.line(3).from, insert: "b\n" });
+    const result = rightDoc.toString().slice(0, change.from) + change.insert + rightDoc.toString().slice(change.to);
+    expect(result).toBe(leftDoc.toString());
+  });
+
+  it("replace, right-to-left: mirrors left-to-right in the other direction", () => {
+    const leftDoc = Text.of(["a", "b", "c", "d"]);
+    const rightDoc = Text.of(["a", "X", "c", "d"]);
+    const hunk: Hunk = { kind: "replace", left: { start: 1, len: 1 }, right: { start: 1, len: 1 } };
+    const change = buildHunkCopyChange(hunk, "rightToLeft", leftDoc, rightDoc)!;
+    expect(change).toEqual({ destSide: "left", from: leftDoc.line(2).from, to: leftDoc.line(3).from, insert: "X\n" });
+    const result = leftDoc.toString().slice(0, change.from) + change.insert + leftDoc.toString().slice(change.to);
+    expect(result).toBe(rightDoc.toString());
+  });
+
+  it("insert hunk, right-to-left: inserts the right-only line into the left at the correct point", () => {
+    const leftDoc = Text.of(["a", "c"]);
+    const rightDoc = Text.of(["a", "b", "c"]);
+    const hunk: Hunk = { kind: "insert", left: { start: 1, len: 0 }, right: { start: 1, len: 1 } };
+    const change = buildHunkCopyChange(hunk, "rightToLeft", leftDoc, rightDoc)!;
+    // an empty destination range -- a pure insertion, not a replace
+    expect(change.from).toBe(change.to);
+    expect(change.destSide).toBe("left");
+    expect(change.insert).toBe("b\n");
+    const result = leftDoc.toString().slice(0, change.from) + change.insert + leftDoc.toString().slice(change.to);
+    expect(result).toBe(rightDoc.toString());
+  });
+
+  it("insert hunk, left-to-right: 'reverting' an insert deletes the right-only line", () => {
+    const leftDoc = Text.of(["a", "c"]);
+    const rightDoc = Text.of(["a", "b", "c"]);
+    const hunk: Hunk = { kind: "insert", left: { start: 1, len: 0 }, right: { start: 1, len: 1 } };
+    const change = buildHunkCopyChange(hunk, "leftToRight", leftDoc, rightDoc)!;
+    expect(change.insert).toBe(""); // the empty source side means "delete", not "insert nothing"
+    expect(change.destSide).toBe("right");
+    const result = rightDoc.toString().slice(0, change.from) + change.insert + rightDoc.toString().slice(change.to);
+    expect(result).toBe(leftDoc.toString());
+  });
+
+  it("delete hunk, left-to-right: inserts the left-only line into the right at the correct point", () => {
+    const leftDoc = Text.of(["a", "b", "c"]);
+    const rightDoc = Text.of(["a", "c"]);
+    const hunk: Hunk = { kind: "delete", left: { start: 1, len: 1 }, right: { start: 1, len: 0 } };
+    const change = buildHunkCopyChange(hunk, "leftToRight", leftDoc, rightDoc)!;
+    expect(change.from).toBe(change.to);
+    expect(change.destSide).toBe("right");
+    expect(change.insert).toBe("b\n");
+    const result = rightDoc.toString().slice(0, change.from) + change.insert + rightDoc.toString().slice(change.to);
+    expect(result).toBe(leftDoc.toString());
+  });
+
+  it("delete hunk, right-to-left: 'reverting' a delete removes the left-only line", () => {
+    const leftDoc = Text.of(["a", "b", "c"]);
+    const rightDoc = Text.of(["a", "c"]);
+    const hunk: Hunk = { kind: "delete", left: { start: 1, len: 1 }, right: { start: 1, len: 0 } };
+    const change = buildHunkCopyChange(hunk, "rightToLeft", leftDoc, rightDoc)!;
+    expect(change.insert).toBe("");
+    expect(change.destSide).toBe("left");
+    const result = leftDoc.toString().slice(0, change.from) + change.insert + leftDoc.toString().slice(change.to);
+    expect(result).toBe(rightDoc.toString());
+  });
+
+  it("handles a replace hunk on the last line of a file with no trailing newline", () => {
+    const leftDoc = Text.of(["a", "b"]); // "a\nb", no trailing newline
+    const rightDoc = Text.of(["a", "X"]);
+    const hunk: Hunk = { kind: "replace", left: { start: 1, len: 1 }, right: { start: 1, len: 1 } };
+    const change = buildHunkCopyChange(hunk, "leftToRight", leftDoc, rightDoc)!;
+    expect(change).toEqual({ destSide: "right", from: rightDoc.line(2).from, to: rightDoc.length, insert: "b" });
+    const result = rightDoc.toString().slice(0, change.from) + change.insert + rightDoc.toString().slice(change.to);
+    expect(result).toBe(leftDoc.toString());
   });
 });
 

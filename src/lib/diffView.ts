@@ -15,6 +15,51 @@ export function posAfterLine(doc: Text, n: number): number {
   return doc.line(n + 1).from;
 }
 
+export interface HunkCopyChange {
+  destSide: "left" | "right";
+  from: number;
+  to: number;
+  insert: string;
+}
+
+/**
+ * Builds the CM6 change needed to copy one hunk's content from one side to the other, per
+ * docs/PLAN.md M2's "apply/revert individual hunks left↔right." Dispatching `{from, to, insert}`
+ * on the `destSide` view reuses the normal edit pipeline unchanged (the resulting transaction is
+ * captured by the same `onEdit` listener as a keystroke would be) — no separate backend command
+ * needed for this feature.
+ *
+ * `posAfterLine` (not a hand-rolled line/char calculation here) is what makes this correct for
+ * `Insert`/`Delete` hunks, where one side's `LineRange.len` is 0: it maps a `{start, len}` line
+ * range to an *empty* character range at exactly the right insertion point when `len` is 0,
+ * rather than needing special-cased logic per hunk kind. That collapses all three hunk kinds and
+ * both copy directions into one formula:
+ * - `Replace`: both ranges non-empty → replaces dest's lines with source's.
+ * - `Insert` copied source→dest where source is the *empty* side → source text is "" → this
+ *   deletes dest's extra lines (i.e. "revert" the insertion).
+ * - `Insert`/`Delete` copied toward the empty side → dest range is empty → this is a pure
+ *   insertion at that point, not a replace.
+ *
+ * Returns `null` for an `Equal` hunk (nothing to copy) — callers are only expected to invoke
+ * this for the currently-selected hunk, which `changeHunks` already excludes `Equal` from, but
+ * the check is kept here too since this function's contract shouldn't rely on that.
+ */
+export function buildHunkCopyChange(hunk: Hunk, direction: "leftToRight" | "rightToLeft", leftDoc: Text, rightDoc: Text): HunkCopyChange | null {
+  if (hunk.kind === "equal") return null;
+  const sourceDoc = direction === "leftToRight" ? leftDoc : rightDoc;
+  const destDoc = direction === "leftToRight" ? rightDoc : leftDoc;
+  const sourceRange = direction === "leftToRight" ? hunk.left : hunk.right;
+  const destRange = direction === "leftToRight" ? hunk.right : hunk.left;
+  const destSide: "left" | "right" = direction === "leftToRight" ? "right" : "left";
+
+  const sourceFrom = posAfterLine(sourceDoc, sourceRange.start);
+  const sourceTo = posAfterLine(sourceDoc, sourceRange.start + sourceRange.len);
+  const destFrom = posAfterLine(destDoc, destRange.start);
+  const destTo = posAfterLine(destDoc, destRange.start + destRange.len);
+
+  return { destSide, from: destFrom, to: destTo, insert: sourceDoc.sliceString(sourceFrom, sourceTo) };
+}
+
 /**
  * Builds line-highlight + alignment-padding decorations for one side of the diff.
  * Hunks are assumed contiguous and gapless across the whole file (diff-core guarantees this).
@@ -374,7 +419,15 @@ export interface ChangeHunkLine {
 /** First line of each non-equal hunk, in document order — the ordered stop list for hunk
  * navigation (`nextHunkIndex`/`prevHunkIndex`). */
 export function changeHunkLines(hunks: Hunk[]): ChangeHunkLine[] {
-  return hunks.filter((h) => h.kind !== "equal").map((h) => ({ left: h.left.start + 1, right: h.right.start + 1 }));
+  return changeHunks(hunks).map((h) => ({ left: h.left.start + 1, right: h.right.start + 1 }));
+}
+
+/** The non-equal hunks only, in document order — same filter as `changeHunkLines`, but
+ * retaining the full `Hunk` (kind + both `LineRange`s) that `buildHunkCopyChange` needs and
+ * `ChangeHunkLine` (just two 1-indexed line numbers, for the nav UI) doesn't carry. Kept as one
+ * shared filter rather than two independent ones so the two lists can never drift apart. */
+export function changeHunks(hunks: Hunk[]): Hunk[] {
+  return hunks.filter((h) => h.kind !== "equal");
 }
 
 /** Wraps forward through `[0, count)`; `-1` (nothing selected yet) advances to the first hunk.
