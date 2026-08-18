@@ -137,3 +137,33 @@ investigation (fixture *generation* itself, ~50k small file writes, took 14-16s 
 almost all in `sys` time -- ordinary local disk I/O on real hardware shouldn't be anywhere near
 that slow for the same operation). Re-measure the scan timing on the real macOS target before
 trusting the ~130ms/~260ms numbers as anything but directional.
+
+**Broken symlinks were verified, not just reasoned about**: a symlink whose target doesn't exist,
+present on only one side, correctly shows up as `LeftOnly`/`RightOnly` rather than silently
+vanishing -- confirmed by reading `ignore` crate's source (`follow_links(false)` makes
+`DirEntry::metadata()` call `fs::symlink_metadata`, which stats the link itself and succeeds
+regardless of whether the target exists) and locked in by
+`a_broken_symlink_present_on_only_one_side_is_reported_as_left_only` in `crates/dirwalk/src/
+lib.rs`. Unix-only (`#[cfg(unix)]`, like the other symlink tests), so this is untested on Windows,
+but that's not a target platform for this project.
+
+**Cancel-click responsiveness under Xvfb/no-window-manager/`xdotool` is its own unverified layer,
+separate from the underlying cancel *mechanism*, which is verified correct.** Reproducing and
+diagnosing a real advisor-flagged gap (see DECISIONS.md, "Cancel is correct end-to-end but not
+guaranteed responsive on very large trees") required synthesizing X11 clicks against a running
+Tauri/WebKitGTK app with no window manager present -- `xdotool windowactivate` doesn't work in this
+setup (`_NET_ACTIVE_WINDOW` unsupported), `windowfocus`/`windowraise` were needed instead, and even
+then a click landed on the first attempt only sometimes; repeated clicks over ~2s were needed to
+reliably land one during a large in-flight scan. This means the specific finding "clicks often
+never reached the backend during a huge scan" is entangled with *how this environment delivers
+synthetic input*, not just app behavior -- a real user with a real mouse under a real compositor on
+macOS may see different (better or worse) responsiveness than what was measured here. On top of
+that, `dirwalk::scan`'s own two-phase design (phase 1 streams zero rows) turned out to confound
+before/after comparisons of candidate fixes -- see DECISIONS.md for why neither mitigation tried
+was cleanly validated or invalidated, not just reported as "didn't help." What's
+platform-independent and trustworthy regardless: the cancel flag/IPC mechanism itself was confirmed
+correct via a real backend round-trip (a temporary debug print showed `cancel_scan` executing while
+`scan_dirs` was still in flight, and cancelling mid-scan always produced the correct `ScanOutcome`).
+**Verify on macOS**: click Cancel during a large real-world directory comparison (a big
+`node_modules` tree is a good candidate) and confirm it's reasonably responsive; if not, see the
+DECISIONS.md entry's "How to apply" for the next lever (table virtualization).

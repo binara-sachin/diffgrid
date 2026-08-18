@@ -363,3 +363,65 @@ nicer presentation layered on later rather than gating the milestone.
 `scan_dirs` already streams (path + status + size, full relative path as the join key) --
 grouping it into a tree is a pure frontend transform over data this milestone already produces
 correctly, not a scan-logic change.
+
+**Correction (same day, caught by advisor review before declaring M3 done)**: this entry's title
+claimed "sorted" from the start, but the first cut of `visibleDirEntries` only filtered
+(hide-identical) -- rows displayed in scan arrival order, and the `LeftOnly` tail specifically was
+`HashMap` iteration order, not even deterministic run to run. Fixed by extracting the filter+sort
+into `src/lib/dirView.ts` (`visibleDirEntries(entries, hideIdentical)`, sorted by path,
+unit-tested in `dirView.test.ts`) and having the component call it inside its `$derived`. Recorded
+here rather than silently editing the title so the gap-then-fix is visible, matching how the mtime
+false-Same entry below documents an observed instance rather than just the abstract risk.
+
+## 2026-08-18 — Cancel is correct end-to-end but not guaranteed *responsive* on very large trees; shipping anyway, scope is the documented 50k target
+
+**Decision**: ship M3's cancel mechanism as-is (cooperative `AtomicBool` checked once per entry
+in both scan phases, `cancel_scan` IPC command, per-scan-generation `Arc` in `ScanState`) plus one
+real mitigation (coalesce `Channel` batches into at most one `dirEntries` update per animation
+frame, in `runDirCompare`), rather than chasing full responsiveness at arbitrary scale.
+
+**Why**: an advisor review flagged that Cancel had only ever been exercised at the unit level
+(`cancel_scan_impl` called directly) and never through a real in-flight `scan_dirs` IPC call --
+the exact path that matters. Verifying it under Xvfb against a synthetic 800k-file tree (16x the
+PLAN.md 50k target, built specifically to widen the cancel-click window) surfaced a real,
+reproducible finding: with tens of thousands of rows already streamed into the unvirtualized
+results table, a `Cancel scan` click frequently never reached the Rust backend at all (confirmed
+via a temporary `eprintln!` in `cancel_scan` -- 0 hits across many repeated clicks while the count
+kept climbing). That specific finding is solid: it was reproduced from a genuinely unfixed
+baseline build with direct backend-side evidence, not inferred from the frontend alone.
+
+What's *not* solid is any claim about which of the two candidate mitigations tried --
+coalescing frontend updates via `requestAnimationFrame`, and raising `BATCH_SIZE` 256 -> 4096 to
+cut IPC round-trips 16x -- actually helped. Both were "tested" by repeating a fixed click sequence
+and comparing how far the scan got before one landed, but that comparison turned out to be
+confounded by something only noticed afterward: `dirwalk::scan`'s two-phase design (this crate's
+own doc comment on `scan`) means phase 1 -- walking the entire left tree into a `HashMap` --
+streams *zero* rows and drives *zero* table re-renders, so a click's odds of landing depend
+heavily on whether it happens to fall inside phase 1 (uncontended, easy) or phase 2 (contended,
+hard) rather than on anything either mitigation changed. Re-running the same "baseline" build
+(rAF fix stashed out) produced a `0 entries found before stopping` result on the very trial meant
+to establish a fixed-free control -- i.e. an easy landing on the unfixed build, which by itself
+would (wrongly) look like proof the fix doesn't matter. Rather than run enough trials to average
+out both that confound and Xvfb/`xdotool`'s own input-delivery jitter (uncertain how many that
+would take, and this is a fixup pass, not a perf investigation), `BATCH_SIZE` was reverted to its
+already-measured-and-documented value of 256 (no evidence justified changing it), and the
+`requestAnimationFrame` coalescing was kept on its own merits -- it is a strict reduction in
+redundant work with no downside, regardless of whether it moves the click-landing needle -- rather
+than being credited with fixing the large-scale case. Three probes in (eprintln evidence, rAF
+timing, batch size) without a clean isolated cause is the "stop and question the architecture"
+signal, so the scope was re-anchored instead to what M3 actually promises: at the documented 50k
+target, the whole scan finishes in ~260ms (measured, see the fixture-generator commit), well under
+any plausible click reaction time, making click-landing-probability irrelevant there. What *is*
+verified correct at every scale tried, independent of all the above: the cancel mechanism itself --
+a click that does land (early or late) always produces the right result (`"scan cancelled — N
+entries found before stopping"` with the right N, `dirScanOutcome.cancelled === true`).
+
+**How to apply**: this is a real, documented scope boundary, not a silently-accepted bug -- if a
+future milestone commits to comparing very large real-world trees (`node_modules`, monorepos,
+vendor directories) as a stated requirement, resist repeating this session's mistake of comparing
+"before" and "after" builds without controlling for the two-phase scan's phase boundary and without
+enough trials to average out synthetic-input jitter. The most promising untried lever is still
+virtualizing the results table (bounding DOM node count regardless of entry count), since it's the
+one variable that would remove the suspected dominant cost (full keyed-`{#each}` reorders) rather
+than just reducing how often it's triggered -- but treat that as a hypothesis to test properly, not
+a conclusion to build on. See PLATFORM_NOTES.md for the Xvfb/no-WM caveat on these measurements.

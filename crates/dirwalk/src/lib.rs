@@ -486,6 +486,18 @@ mod tests {
         assert!(!entries.iter().any(|e| e.path.starts_with("link-to-real/")));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_symlink_present_on_only_one_side_is_reported_as_left_only() {
+        use std::os::unix::fs::symlink;
+        let (left, right) = test_dirs("symlink-broken-left-only");
+        symlink(left.join("does-not-exist"), left.join("dangling")).unwrap();
+        let (entries, _) = scan_all(&left, &right, &ScanOptions::default());
+        let dangling = find(&entries, "dangling");
+        assert!(dangling.is_symlink);
+        assert_eq!(dangling.status, EntryStatus::LeftOnly);
+    }
+
     #[test]
     fn gitignore_is_respected_by_default() {
         let (left, right) = test_dirs("gitignore-respected");
