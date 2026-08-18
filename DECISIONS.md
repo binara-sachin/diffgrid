@@ -155,3 +155,46 @@ scoped as done-done.
 **How to apply**: don't add click-to-expand to collapse in isolation — do it as part of the
 StateField refactor that whitespace/case-ignore toggles require anyway, so the same live-update
 mechanism serves both.
+
+## 2026-08-18 — Intra-line highlighting must honor ignore-whitespace/ignore-case, not just line-level diff
+
+**Bug found by review, not by the existing test suite**: `intra_line_spans` did exact-match
+prefix/suffix trimming with no awareness of `DiffOptions`. With ignore-whitespace on, a line
+differing in *both* whitespace amount and real content (e.g. `"  foo  bar"` vs `"foo baz"`)
+still enters a `Replace` hunk (normalized forms differ), but the raw first/last characters never
+matched, so the entire line highlighted on both sides — toggling the checkbox visibly changed
+nothing about that line's highlight even though it changed which lines counted as hunks at all.
+Existing tests never caught this because the toggle-verification tests all used
+whitespace-*only* differences (correctly producing zero hunks, so no intra-line fetch ever
+fired), and diff-core's intra-line tests never passed options because the function couldn't
+accept them.
+
+**Fix**: added `intra_line_spans_with_options`, a second prefix/suffix trim that walks raw
+UTF-16 units directly (not a normalized string) so the returned offsets stay valid indices into
+the *raw* line — normalizing first and trimming that would misalign every highlight the same way
+the earlier UTF-16-as-binary bug did, just silently. Whitespace-run matching mirrors
+`normalize_line`'s `split_whitespace().join(" ")` semantics (a run on one side matches a run of
+any length on the other; presence-vs-absence of a run is still a real difference); case-folding
+at the unit level is ASCII-only (ASCII a-z/A-Z), narrower than `normalize_line`'s full Unicode
+`to_lowercase()`, because a full Unicode case fold can change unit counts and break the
+raw-offset guarantee. Documented as an accepted narrowing rather than left unremarked.
+
+**How to apply**: any future change to how the line-level diff normalizes text for comparison
+must have a matching change here, or the same class of "toggle changes the hunk, not the
+highlight" bug reappears. If intra-line highlighting is ever generalized beyond ignore-
+whitespace/ignore-case, keep the raw-offset invariant — verify with a test asserting
+`start_utf16`/`len_utf16` index into the *raw* input strings, not just that span count changed.
+
+## 2026-08-18 — Settings-window intra-line mode (Off/Word/Character) not built; Character only
+
+`ui-02.png`'s mockup shows a three-way intra-line-highlight setting: Off / Word / Character. M1
+ships Character-level highlighting only, always on for `Replace` hunks — there is no settings
+window, and no way to switch to Word-level or turn highlighting off. This is a real gap against
+the mockup, not an oversight discovered late: the settings window itself is scoped to a later
+milestone (M4's session shell), so there was nowhere to put the toggle yet. Noting it explicitly
+here rather than leaving it as an unremarked deviation from the approved design.
+
+**How to apply**: when the M4 settings window is built, add the Off/Word/Character control then.
+Word-level highlighting would need a different segmentation than the current prefix/suffix trim
+(word-boundary-aware diffing, not raw UTF-16-unit trimming) — treat it as new work, not a trivial
+mode flag on the existing function.

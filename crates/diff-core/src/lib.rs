@@ -94,6 +94,146 @@ pub fn intra_line_spans(left: &str, right: &str) -> Vec<Span> {
     spans
 }
 
+fn is_ascii_ws_unit(u: u16) -> bool {
+    matches!(u, 0x20 | 0x09 | 0x0a | 0x0d | 0x0c | 0x0b)
+}
+
+fn eq_unit(a: u16, b: u16, ignore_case: bool) -> bool {
+    if a == b {
+        return true;
+    }
+    if !ignore_case {
+        return false;
+    }
+    // ASCII-only case fold at the UTF-16-unit level -- matches the overwhelming majority of
+    // real source code. Unlike `normalize_line`'s full Unicode `to_lowercase()`, folding
+    // per-unit while preserving raw offsets can't use a full Unicode case fold (that can change
+    // the number of units), so this is a deliberately narrower approximation for this path only.
+    let fold = |u: u16| if (b'A' as u16..=b'Z' as u16).contains(&u) { u + 32 } else { u };
+    fold(a) == fold(b)
+}
+
+/// Common-prefix length in raw UTF-16 units for each side, honoring `opts`. Under
+/// `ignore_whitespace`, a maximal whitespace run on one side matches a maximal whitespace run on
+/// the other regardless of length (mirroring `normalize_line`'s `split_whitespace().join(" ")`),
+/// and leading whitespace is skipped entirely on both sides first (mirroring
+/// `split_whitespace()` dropping it) -- but whitespace present on only one side is a real
+/// difference, not something to skip past. Returns raw indices, never normalized ones: these
+/// feed directly into `Span.start_utf16`, which the frontend adds to the *rendered* line's raw
+/// offset.
+fn common_prefix_len_raw(left: &[u16], right: &[u16], opts: DiffOptions) -> (usize, usize) {
+    let mut li = 0;
+    let mut ri = 0;
+    if opts.ignore_whitespace {
+        while li < left.len() && is_ascii_ws_unit(left[li]) {
+            li += 1;
+        }
+        while ri < right.len() && is_ascii_ws_unit(right[ri]) {
+            ri += 1;
+        }
+    }
+    loop {
+        if li >= left.len() || ri >= right.len() {
+            break;
+        }
+        let (a, b) = (left[li], right[ri]);
+        if opts.ignore_whitespace && is_ascii_ws_unit(a) && is_ascii_ws_unit(b) {
+            while li < left.len() && is_ascii_ws_unit(left[li]) {
+                li += 1;
+            }
+            while ri < right.len() && is_ascii_ws_unit(right[ri]) {
+                ri += 1;
+            }
+            continue;
+        }
+        if opts.ignore_whitespace && (is_ascii_ws_unit(a) || is_ascii_ws_unit(b)) {
+            break;
+        }
+        if !eq_unit(a, b, opts.ignore_case) {
+            break;
+        }
+        li += 1;
+        ri += 1;
+    }
+    (li, ri)
+}
+
+/// Symmetric counterpart to `common_prefix_len_raw`, scanning from the end. Bounded by
+/// `left_start`/`right_start` so it can never walk back past the already-claimed prefix.
+/// Returns suffix lengths (counts of trailing units claimed), not raw indices.
+fn common_suffix_len_raw(
+    left: &[u16],
+    right: &[u16],
+    left_start: usize,
+    right_start: usize,
+    opts: DiffOptions,
+) -> (usize, usize) {
+    let mut li = left.len();
+    let mut ri = right.len();
+    if opts.ignore_whitespace {
+        while li > left_start && is_ascii_ws_unit(left[li - 1]) {
+            li -= 1;
+        }
+        while ri > right_start && is_ascii_ws_unit(right[ri - 1]) {
+            ri -= 1;
+        }
+    }
+    loop {
+        if li <= left_start || ri <= right_start {
+            break;
+        }
+        let (a, b) = (left[li - 1], right[ri - 1]);
+        if opts.ignore_whitespace && is_ascii_ws_unit(a) && is_ascii_ws_unit(b) {
+            while li > left_start && is_ascii_ws_unit(left[li - 1]) {
+                li -= 1;
+            }
+            while ri > right_start && is_ascii_ws_unit(right[ri - 1]) {
+                ri -= 1;
+            }
+            continue;
+        }
+        if opts.ignore_whitespace && (is_ascii_ws_unit(a) || is_ascii_ws_unit(b)) {
+            break;
+        }
+        if !eq_unit(a, b, opts.ignore_case) {
+            break;
+        }
+        li -= 1;
+        ri -= 1;
+    }
+    (left.len() - li, right.len() - ri)
+}
+
+/// `DiffOptions`-aware counterpart to `intra_line_spans`. The plain version is exact-match
+/// prefix/suffix trimming, which is correct only when the line-level diff that decided this pair
+/// is a `Replace` hunk also used exact matching. Once ignore-whitespace/ignore-case are on, a
+/// line can be a `Replace` hunk (differs after normalization) while *also* differing in raw
+/// leading/trailing whitespace or casing that the toggle says not to care about -- exact-match
+/// trimming then finds no common affix at all and highlights the entire line on both sides,
+/// which is wrong: it should still narrow to just the part that differs under the same rules the
+/// line-level diff used. Offsets returned are always raw indices (see `common_prefix_len_raw`).
+pub fn intra_line_spans_with_options(left: &str, right: &str, opts: DiffOptions) -> Vec<Span> {
+    if !opts.ignore_whitespace && !opts.ignore_case {
+        return intra_line_spans(left, right);
+    }
+    let l: Vec<u16> = left.encode_utf16().collect();
+    let r: Vec<u16> = right.encode_utf16().collect();
+
+    let (prefix_l, prefix_r) = common_prefix_len_raw(&l, &r, opts);
+    let (suffix_l, suffix_r) = common_suffix_len_raw(&l, &r, prefix_l, prefix_r, opts);
+    let end_l = l.len() - suffix_l;
+    let end_r = r.len() - suffix_r;
+
+    let mut spans = Vec::new();
+    if end_l > prefix_l {
+        spans.push(Span { side: Side::Left, start_utf16: prefix_l as u32, len_utf16: (end_l - prefix_l) as u32 });
+    }
+    if end_r > prefix_r {
+        spans.push(Span { side: Side::Right, start_utf16: prefix_r as u32, len_utf16: (end_r - prefix_r) as u32 });
+    }
+    spans
+}
+
 /// Line-level diff via the histogram algorithm. Intra-line spans are deliberately
 /// not computed here — per docs/PLAN.md they are viewport-driven, requested lazily
 /// by the frontend for visible Replace hunks only.
@@ -474,5 +614,94 @@ mod tests {
         let result = diff_lines_with_options("a\nb\nc", "a\nb\nc\n", opts);
         let non_equal: Vec<_> = result.hunks.iter().filter(|h| h.kind != HunkKind::Equal).collect();
         assert_eq!(non_equal.len(), 1);
+    }
+
+    #[test]
+    fn every_equal_hunk_has_matching_line_counts_on_both_sides() {
+        // Collapsed-region rendering on the frontend assumes an Equal hunk's left and right
+        // line counts always match (so both panes collapse the same number of lines and stay
+        // in sync). This is a property of diff_lines' construction (each Equal hunk is exactly
+        // the untouched gap between two non-equal hunks, which imara-diff always advances by
+        // the same amount on both sides for context it didn't touch), not asserted anywhere --
+        // pin it here so a future change to hunk construction can't silently break it.
+        let left = "a\nb\nc\nd\ne\nf\ng\n";
+        let right = "a\nX\nc\nd\ne\nY\ng\n";
+        let result = diff_lines(left, right);
+        for h in result.hunks.iter().filter(|h| h.kind == HunkKind::Equal) {
+            assert_eq!(h.left.len, h.right.len, "Equal hunk {:?} has mismatched side lengths", h);
+        }
+    }
+
+    #[test]
+    fn options_aware_intra_line_spans_matches_the_plain_version_when_no_toggle_is_set() {
+        let opts = DiffOptions::default();
+        assert_eq!(
+            intra_line_spans_with_options("prefix-123-suffix", "prefix-abc-suffix", opts),
+            intra_line_spans("prefix-123-suffix", "prefix-abc-suffix")
+        );
+    }
+
+    /// Regression test for a real bug caught by review, not by the existing test suite: the
+    /// plain `intra_line_spans` ignores `DiffOptions` entirely, so a line that differs in *both*
+    /// whitespace amount and real content highlighted the whole line on both sides even with
+    /// ignore-whitespace on, because the raw first/last characters never matched. The offsets
+    /// returned must still index into the *raw*, un-normalized line -- `spansToMarkRanges` adds
+    /// them to the rendered document's line offsets, so normalized-coordinate offsets would
+    /// silently misalign every highlight, the same class of bug as the earlier UTF-16-as-binary
+    /// mistake.
+    #[test]
+    fn ignore_whitespace_narrows_the_span_to_the_real_difference_not_the_whole_line() {
+        let opts = DiffOptions { ignore_whitespace: true, ignore_case: false };
+        let spans = intra_line_spans_with_options("  foo  bar", "foo baz", opts);
+        assert_eq!(
+            spans,
+            vec![
+                Span { side: Side::Left, start_utf16: 9, len_utf16: 1 },
+                Span { side: Side::Right, start_utf16: 6, len_utf16: 1 },
+            ]
+        );
+        // sanity-check the offsets really do index into the raw strings as claimed
+        let left_units: Vec<u16> = "  foo  bar".encode_utf16().collect();
+        let right_units: Vec<u16> = "foo baz".encode_utf16().collect();
+        assert_eq!(left_units[9], 'r' as u16);
+        assert_eq!(right_units[6], 'z' as u16);
+    }
+
+    #[test]
+    fn ignore_whitespace_finds_no_span_at_all_when_only_whitespace_amount_differs() {
+        let opts = DiffOptions { ignore_whitespace: true, ignore_case: false };
+        assert_eq!(intra_line_spans_with_options("  foo   bar  ", "foo bar", opts), vec![]);
+    }
+
+    #[test]
+    fn ignore_case_finds_no_span_when_only_casing_differs() {
+        let opts = DiffOptions { ignore_whitespace: false, ignore_case: true };
+        assert_eq!(intra_line_spans_with_options("FOO bar", "foo BAR", opts), vec![]);
+    }
+
+    #[test]
+    fn combining_both_toggles_narrows_to_the_real_difference() {
+        let opts = DiffOptions { ignore_whitespace: true, ignore_case: true };
+        let spans = intra_line_spans_with_options("  Hello   World", "hello world!", opts);
+        assert_eq!(
+            spans,
+            vec![Span { side: Side::Right, start_utf16: 11, len_utf16: 1 }],
+            "only the trailing '!' should be flagged as a real difference"
+        );
+    }
+
+    #[test]
+    fn without_toggles_the_options_aware_version_behaves_like_a_plain_diff() {
+        let opts = DiffOptions::default();
+        let spans = intra_line_spans_with_options("  foo  bar", "foo baz", opts);
+        // no ignoring at all: the leading whitespace difference alone breaks the common prefix,
+        // so (unlike the ignore-whitespace case above) the whole line is flagged on both sides.
+        assert_eq!(
+            spans,
+            vec![
+                Span { side: Side::Left, start_utf16: 0, len_utf16: 10 },
+                Span { side: Side::Right, start_utf16: 0, len_utf16: 7 },
+            ]
+        );
     }
 }

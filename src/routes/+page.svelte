@@ -139,7 +139,7 @@
     const rightDoc = Text.of(rightText.split("\n"));
 
     const fetchSpans = (leftLine: string, rightLine: string) =>
-      invoke<Span[]>("intra_line_spans", { leftLine, rightLine });
+      invoke<Span[]>("intra_line_spans", { leftLine, rightLine, ignoreWhitespace, ignoreCase });
     const onFetchError = (message: string) => invoke("report_error", { message: `intra-line: ${message}` });
 
     status = "mounting editors…";

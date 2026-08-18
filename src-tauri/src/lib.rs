@@ -100,10 +100,24 @@ fn open_file_text(path: String) -> Result<Response, String> {
 
 /// Viewport-driven per docs/PLAN.md §6: the frontend calls this once per visible `Replace`-hunk
 /// line pair as they scroll into view, not eagerly for the whole file. Thin wrapper — all the
-/// actual logic (and its tests) live in `diff_core::intra_line_spans`.
+/// actual logic (and its tests) live in `diff_core::intra_line_spans_with_options`.
+///
+/// Must take the same ignore-whitespace/ignore-case toggles as `diff_texts`: without them, a
+/// line that differs in both whitespace and real content highlights as "the whole line changed"
+/// even when the toggle says the whitespace part doesn't count, because the line-level diff and
+/// the intra-line diff would be applying different rules to the same pair.
 #[tauri::command]
-fn intra_line_spans(left_line: String, right_line: String) -> Vec<diff_core::Span> {
-    diff_core::intra_line_spans(&left_line, &right_line)
+fn intra_line_spans(
+    left_line: String,
+    right_line: String,
+    ignore_whitespace: bool,
+    ignore_case: bool,
+) -> Vec<diff_core::Span> {
+    diff_core::intra_line_spans_with_options(
+        &left_line,
+        &right_line,
+        diff_core::DiffOptions { ignore_whitespace, ignore_case },
+    )
 }
 
 /// Re-diffs two already-loaded, already-normalized texts with whitespace/case-ignore toggles
