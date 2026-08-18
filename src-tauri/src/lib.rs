@@ -5,14 +5,19 @@ use tauri::ipc::Response;
 #[derive(Serialize)]
 struct BenchFlags {
     disable_padding: bool,
+    collapse_equal: bool,
 }
 
-/// M0 A/B toggle: lets the measurement harness isolate whether the block-widget alignment
-/// padding is the source of the scroll-onset stall, rather than asserting a cause untested.
+/// M0/M1 A/B toggles: let the measurement harness isolate whether a given decoration mechanism
+/// is the source of a scroll-performance regression, rather than asserting a cause untested.
+/// `collapse_equal` probes whether `Decoration.replace({block:true})` (the only CM6 mechanism
+/// for collapsing unchanged regions) costs what `Decoration.widget({block:true})` did before
+/// docs/PROFILING.md's fix — see DECISIONS.md.
 #[tauri::command]
 fn bench_flags() -> BenchFlags {
     BenchFlags {
         disable_padding: std::env::var("DIFFGRID_DISABLE_PADDING").is_ok(),
+        collapse_equal: std::env::var("DIFFGRID_COLLAPSE_EQUAL").is_ok(),
     }
 }
 

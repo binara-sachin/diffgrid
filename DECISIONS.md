@@ -125,3 +125,33 @@ of a long line get merged into one span covering everything between them). Don't
 speculatively — revisit only if it visibly produces unhelpfully large spans on real content, and
 prefer a bounded approach (e.g. LCS only below a length cap, falling back to trimming above it)
 over an unconditional full LCS if it does.
+
+## 2026-08-18 — Collapsed unchanged regions shipped; click-to-expand deferred
+
+**Decision**: `Decoration.replace({block: true})` collapsing large `Equal` hunks (>20 lines,
+leaving 3 lines of context at each edge) ships as an always-on part of real file diffs. There is
+no click-to-expand — a collapsed region stays collapsed for the life of the view.
+
+**Why measured, not assumed, before shipping**: `Decoration.replace` is a block-level decoration,
+the same class `docs/PROFILING.md` found triggers CM6's expensive non-uniform-height layout mode
+for `Decoration.widget`. Before writing any UI, this was A/B measured with
+`bench/m0-spike.mjs --collapse-equal` against the current (already-fixed) padding baseline: 392
+collapsed ranges on the 100k-line fixture, fps 57.6→57.8 and paint 101ms→110ms — both within
+noise. Unlike a widget (which adds height CM6 must track alongside surrounding lines), a
+`replace` decoration removes its range from layout entirely, which is apparently why it doesn't
+trip the same mode. Shipping this on the strength of that measurement, not the a priori
+assumption that "block-level always means slow" — the earlier investigation characterized one
+specific mechanism, not the whole decoration category.
+
+**Why click-to-expand is deferred, not silently missing**: making a collapsed region
+interactive means the decoration set has to react to a UI event, which means `createDiffEditor`'s
+static `EditorView.decorations.of(...)` needs to become a `StateField` updated by dispatched
+effects — the same refactor whitespace/case-ignore toggles need for their own reason (a toggle
+changes the hunk list, which changes every decoration derived from it). Doing that refactor once,
+for both features together, is the plan — see the next DECISIONS.md entry when that work starts.
+Shipping collapse now without interactivity is a real, usable subset of the feature; it is not
+scoped as done-done.
+
+**How to apply**: don't add click-to-expand to collapse in isolation — do it as part of the
+StateField refactor that whitespace/case-ignore toggles require anyway, so the same live-update
+mechanism serves both.
