@@ -9,6 +9,8 @@ import {
   buildCollapseRanges,
   COLLAPSE_CONTEXT_LINES,
   COLLAPSE_MIN_HUNK_LINES,
+  createDiffEditor,
+  updateHunks,
 } from "./diffView";
 import type { Hunk, Span } from "./types";
 
@@ -214,5 +216,49 @@ describe("buildCollapseRanges", () => {
     const hunks: Hunk[] = [{ kind: "equal", left: { start: 0, len: bigLen }, right: { start: 0, len: bigLen } }];
     // doc only has 5 real lines even though the hunk metadata claims bigLen -- defensive
     expect(buildCollapseRanges(doc(5), hunks, "left")).toEqual([]);
+  });
+});
+
+describe("updateHunks", () => {
+  it("recomputes line-highlight decorations in place, without recreating the editor", () => {
+    const text = "a\nb\nc\n";
+    const initialHunks: Hunk[] = [
+      { kind: "equal", left: { start: 0, len: 1 }, right: { start: 0, len: 1 } },
+      { kind: "replace", left: { start: 1, len: 1 }, right: { start: 1, len: 1 } },
+      { kind: "equal", left: { start: 2, len: 1 }, right: { start: 2, len: 1 } },
+    ];
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const view = createDiffEditor(parent, text, initialHunks, "left");
+
+    expect(view.dom.querySelectorAll(".diff-line-replace").length).toBe(1);
+
+    // simulate a whitespace/case-ignore toggle that now finds no differences at all
+    const allEqualHunks: Hunk[] = [{ kind: "equal", left: { start: 0, len: 3 }, right: { start: 0, len: 3 } }];
+    updateHunks(view, allEqualHunks);
+
+    expect(view.dom.querySelectorAll(".diff-line-replace").length).toBe(0);
+    view.destroy();
+  });
+
+  it("clears intra-line highlight decorations immediately when hunks change, before any new fetch resolves", async () => {
+    const text = "a\nb\nc\n";
+    const hunks: Hunk[] = [
+      { kind: "equal", left: { start: 0, len: 1 }, right: { start: 0, len: 1 } },
+      { kind: "replace", left: { start: 1, len: 1 }, right: { start: 1, len: 1 } },
+      { kind: "equal", left: { start: 2, len: 1 }, right: { start: 2, len: 1 } },
+    ];
+    const otherDoc = Text.of(text.split("\n"));
+    const fetchSpans = async (): Promise<Span[]> => [{ side: "left", startUtf16: 0, lenUtf16: 1 }];
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const view = createDiffEditor(parent, text, hunks, "left", false, { otherDoc, fetchSpans });
+
+    await new Promise((r) => setTimeout(r, 10)); // let the initial intra-line fetch resolve
+    expect(view.dom.querySelectorAll(".diff-intra").length).toBeGreaterThan(0);
+
+    updateHunks(view, [{ kind: "equal", left: { start: 0, len: 3 }, right: { start: 0, len: 3 } }]);
+    expect(view.dom.querySelectorAll(".diff-intra").length).toBe(0);
+    view.destroy();
   });
 });

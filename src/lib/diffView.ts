@@ -1,4 +1,4 @@
-import { EditorState, RangeSetBuilder, StateEffect, StateField, Text } from "@codemirror/state";
+import { EditorState, RangeSet, RangeSetBuilder, StateEffect, StateField, Text } from "@codemirror/state";
 import { EditorView, Decoration, type DecorationSet, ViewPlugin, type ViewUpdate, WidgetType, lineNumbers, keymap } from "@codemirror/view";
 import { defaultKeymap } from "@codemirror/commands";
 import { javascript } from "@codemirror/lang-javascript";
@@ -129,33 +129,60 @@ export function spansToMarkRanges(spans: Span[], doc: Text, lineNo: number, side
 
 export type SpansFetcher = (leftLine: string, rightLine: string) => Promise<Span[]>;
 
+/**
+ * Dispatched whenever the hunk list changes — currently only from a whitespace/case-ignore
+ * toggle re-diffing the same two texts. Both the main decoration field and the intra-line
+ * highlighter below listen for this on the same view, so one dispatch keeps every
+ * hunk-derived visual in sync. See `updateHunks`.
+ */
+export const setHunks = StateEffect.define<Hunk[]>();
+
 const setIntraLineDecorations = StateEffect.define<DecorationSet>();
 
-const intraLineField = StateField.define<DecorationSet>({
-  create: () => Decoration.none,
-  update(value, tr) {
-    for (const effect of tr.effects) {
-      if (effect.is(setIntraLineDecorations)) value = effect.value;
-    }
-    return value;
-  },
-  provide: (field) => EditorView.decorations.from(field),
-});
+/**
+ * Recomputes everything `createDiffEditor` derives from the hunk list except intra-line spans
+ * (those are fetched lazily and live in their own field, since they depend on data the hunk
+ * list alone doesn't carry). Combines two independently-built decoration sets via `RangeSet.join`
+ * rather than one shared builder pass, since padding/collapse are conceptually separate steps
+ * (and collapse is optional) — merging is O(n) and CM6-provided, not worth folding into one loop.
+ */
+function computeMainDecorations(doc: Text, hunks: Hunk[], side: "left" | "right", disablePadding: boolean, collapseEqual: boolean): DecorationSet {
+  const main = buildDecorations(doc, hunks, side, disablePadding);
+  const collapse = collapseEqual ? buildCollapseDecorations(doc, hunks, side) : Decoration.none;
+  return RangeSet.join([main, collapse]);
+}
+
+function mainDecorationsField(side: "left" | "right", disablePadding: boolean, collapseEqual: boolean) {
+  return StateField.define<DecorationSet>({
+    create: () => Decoration.none, // overridden per-instance via `.init(...)` in createDiffEditor
+    update(value, tr) {
+      for (const effect of tr.effects) {
+        if (effect.is(setHunks)) value = computeMainDecorations(tr.state.doc, effect.value, side, disablePadding, collapseEqual);
+      }
+      return value;
+    },
+    provide: (field) => EditorView.decorations.from(field),
+  });
+}
 
 /**
  * CM6 extension applying character-level highlight marks to `Replace`-hunk lines, fetched
  * lazily per docs/PLAN.md §6 as they scroll into view rather than eagerly for the whole file.
  * `otherDoc` is the opposite pane's document — needed because a line pair's spans depend on
- * both sides' text, not just this pane's own. Read-only for M1: `otherDoc` is captured once at
- * construction and never re-read, since neither pane's content can change yet (that's M2).
+ * both sides' text, not just this pane's own. `otherDoc` itself is fixed at construction (no
+ * side's *text* can change yet — that's M2's editing feature), but the hunk list can, via a
+ * dispatched `setHunks` effect (a whitespace/case-ignore toggle re-diffing the same text) —
+ * the cache is keyed by line-number pairs, which point at different content once hunks change,
+ * so it's invalidated whenever that happens rather than only tracking viewport changes.
  */
 export function intraLineHighlighter(
-  hunks: Hunk[],
+  initialHunks: Hunk[],
   side: "left" | "right",
   otherDoc: Text,
   fetchSpans: SpansFetcher,
   onFetchError?: (message: string) => void,
 ) {
+  let hunks = initialHunks;
   const cache = new Map<string, Span[]>();
   const pending = new Set<string>();
 
@@ -181,7 +208,25 @@ export function intraLineHighlighter(
         this.schedule(view);
       }
       update(update: ViewUpdate) {
-        if (update.viewportChanged) this.schedule(update.view);
+        let hunksChanged = false;
+        for (const tr of update.transactions) {
+          for (const effect of tr.effects) {
+            if (effect.is(setHunks)) {
+              hunks = effect.value;
+              hunksChanged = true;
+            }
+          }
+        }
+        // The field clears its own decorations synchronously in reaction to the same
+        // `setHunks` effect (see below) — no re-dispatch needed here, which matters because
+        // dispatching from inside a ViewPlugin's update() while one is already in progress is
+        // unsafe. This only clears this plugin's own in-memory cache/pending set and kicks off
+        // fresh fetches for the new hunk list.
+        if (hunksChanged) {
+          cache.clear();
+          pending.clear();
+        }
+        if (update.viewportChanged || hunksChanged) this.schedule(update.view);
       }
       schedule(view: EditorView) {
         const fromLine = view.state.doc.lineAt(view.viewport.from).number;
@@ -209,7 +254,29 @@ export function intraLineHighlighter(
     },
   );
 
+  const intraLineField = StateField.define<DecorationSet>({
+    create: () => Decoration.none,
+    update(value, tr) {
+      for (const effect of tr.effects) {
+        // `setHunks` invalidates in the same transaction, synchronously — a stale span cache
+        // keyed by line-number pairs would otherwise point at different content once hunks
+        // change, and re-dispatching from inside this plugin's own update() to clear it later
+        // would be a reentrant dispatch.
+        if (effect.is(setHunks)) value = Decoration.none;
+        if (effect.is(setIntraLineDecorations)) value = effect.value;
+      }
+      return value;
+    },
+    provide: (field) => EditorView.decorations.from(field),
+  });
+
   return [intraLineField, plugin];
+}
+
+/** Re-diffed hunks (e.g. from a whitespace/case-ignore toggle) — updates every hunk-derived
+ * decoration on `view` in one dispatch, without recreating the editor or losing scroll position. */
+export function updateHunks(view: EditorView, hunks: Hunk[]): void {
+  view.dispatch({ effects: setHunks.of(hunks) });
 }
 
 export const COLLAPSE_CONTEXT_LINES = 3;
@@ -297,8 +364,7 @@ export function createDiffEditor(
   collapseEqual = false,
 ): EditorView {
   const doc = Text.of(text.split("\n"));
-  const decorations = buildDecorations(doc, hunks, side, disablePadding);
-  const collapseDecorations = collapseEqual ? buildCollapseDecorations(doc, hunks, side) : Decoration.none;
+  const field = mainDecorationsField(side, disablePadding, collapseEqual);
 
   const state = EditorState.create({
     doc,
@@ -307,8 +373,7 @@ export function createDiffEditor(
       keymap.of(defaultKeymap),
       javascript(),
       EditorState.readOnly.of(true),
-      EditorView.decorations.of(decorations),
-      EditorView.decorations.of(collapseDecorations),
+      field.init(() => computeMainDecorations(doc, hunks, side, disablePadding, collapseEqual)),
       ...(intraLine
         ? intraLineHighlighter(hunks, side, intraLine.otherDoc, intraLine.fetchSpans, intraLine.onFetchError)
         : []),
