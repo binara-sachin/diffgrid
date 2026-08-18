@@ -1,8 +1,9 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use session::EditBuffer;
-use tauri::ipc::Response;
+use tauri::ipc::{Channel, Response};
 
 /// M2's in-memory edit state for the single open file pair (per docs/PLAN.md §5 — no session
 /// shell/multi-tab yet, so exactly one left/right pair). `None` before any file is opened (the
@@ -21,6 +22,16 @@ struct SessionState {
 enum Side {
     Left,
     Right,
+}
+
+/// M3's directory-scan cancellation state (docs/PLAN.md §5/M3): holds the *current* scan's
+/// cancel flag, if one is running. A fresh `Arc<AtomicBool>` per scan (not one reused flag) is
+/// what lets `cancel_scan` target only the scan that was actually running when it was called --
+/// without this, a cancel request racing a brand-new scan the user just started could kill the
+/// wrong one.
+#[derive(Default)]
+struct ScanState {
+    current_cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 #[derive(Serialize)]
@@ -230,6 +241,73 @@ fn save_file(state: tauri::State<SessionState>, side: Side, path: String) -> Res
     save_file_impl(&state, side, &path)
 }
 
+/// Lets the frontend branch `diffgrid ARG1 ARG2` between M1/M2's file-pair view and M3's
+/// directory-compare view without guessing from the path string (extension-sniffing would be
+/// wrong for extensionless files/directories) -- it asks the filesystem directly.
+#[tauri::command]
+fn path_kind(path: String) -> Result<String, String> {
+    let metadata = std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?;
+    Ok(if metadata.is_dir() { "dir".to_string() } else { "file".to_string() })
+}
+
+/// Installs a fresh cancel flag as *the* current scan, replacing whatever was there before (a
+/// scan that finished normally leaves a stale flag behind harmlessly; a scan that was still
+/// running gets orphaned, which is fine -- it keeps its own clone of the old flag and simply
+/// becomes uncancellable, since nothing else references it). Split out from `scan_dirs` so this
+/// bookkeeping is testable without `tauri::State`, which has no public constructor.
+fn register_new_scan(state: &ScanState) -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    *state.current_cancel.lock().unwrap() = Some(cancel.clone());
+    cancel
+}
+
+fn cancel_scan_impl(state: &ScanState) {
+    if let Some(flag) = state.current_cancel.lock().unwrap().as_ref() {
+        flag.store(true, Ordering::Relaxed);
+    }
+}
+
+/// M3's directory-pair scan, per docs/PLAN.md §3/§5: runs `dirwalk::scan` on a blocking thread
+/// (directory walking and content comparison are blocking I/O, not suited to the async Tauri
+/// command executor directly) and streams batches to the frontend over `channel` as they're
+/// produced, rather than returning the whole result only once the scan completes -- the
+/// "incremental" half of the milestone's requirement. The ordinary `Result` return value is the
+/// summary (`ScanOutcome`), available once the blocking task finishes either way.
+#[tauri::command]
+async fn scan_dirs(
+    scan_state: tauri::State<'_, ScanState>,
+    left: String,
+    right: String,
+    respect_gitignore: bool,
+    exclude_globs: Vec<String>,
+    channel: Channel<Vec<dirwalk::DirEntry>>,
+) -> Result<dirwalk::ScanOutcome, String> {
+    let cancel = register_new_scan(&scan_state);
+
+    let left_root = PathBuf::from(left);
+    let right_root = PathBuf::from(right);
+    let options = dirwalk::ScanOptions { respect_gitignore, exclude_globs };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        dirwalk::scan(&left_root, &right_root, &options, &cancel, |batch| {
+            // A send failure here means the frontend's channel is gone (window closed mid-scan)
+            // -- nothing to do but let the scan keep running to completion; there's no separate
+            // "abandoned" signal to act on, and the cancel flag is the only cooperative stop
+            // mechanism this crate has.
+            let _ = channel.send(batch);
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Requests cancellation of whichever scan is currently running, if any. A no-op if no scan is
+/// in progress (including "already finished") -- there's nothing to signal.
+#[tauri::command]
+fn cancel_scan(scan_state: tauri::State<ScanState>) {
+    cancel_scan_impl(&scan_state)
+}
+
 /// Argv (excluding argv[0]) as handed to the process. `diffgrid FILE1 FILE2` is M1's real
 /// entry point; the frontend falls back to the M0 fixture-benchmark flow when this is empty,
 /// which is exactly how `bench/m0-spike.mjs` invokes the binary today (no arguments).
@@ -369,6 +447,82 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"X\nb\nc\n");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn path_kind_distinguishes_files_from_directories() {
+        let dir = std::env::temp_dir().join(format!("diffgrid-test-{}-path-kind", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(path_kind(dir.to_str().unwrap().to_string()).unwrap(), "dir");
+        assert_eq!(path_kind(file.to_str().unwrap().to_string()).unwrap(), "file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn path_kind_errors_on_a_path_that_does_not_exist() {
+        assert!(path_kind("/does/not/exist/anywhere".to_string()).is_err());
+    }
+
+    #[test]
+    fn register_new_scan_installs_a_fresh_unset_flag_each_time() {
+        let state = ScanState::default();
+        let first = register_new_scan(&state);
+        first.store(true, Ordering::Relaxed);
+        let second = register_new_scan(&state);
+        assert!(!second.load(Ordering::Relaxed), "a new scan's flag must start false regardless of a prior scan's state");
+    }
+
+    #[test]
+    fn cancel_scan_impl_sets_the_flag_of_the_currently_registered_scan() {
+        let state = ScanState::default();
+        let cancel = register_new_scan(&state);
+        assert!(!cancel.load(Ordering::Relaxed));
+        cancel_scan_impl(&state);
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cancel_scan_impl_only_affects_the_most_recently_registered_scan() {
+        // A stale cancel request for a scan the frontend has already moved on from must never
+        // reach a scan that started after it -- the whole reason ScanState holds a fresh Arc
+        // per scan instead of one reused flag.
+        let state = ScanState::default();
+        let stale = register_new_scan(&state);
+        let current = register_new_scan(&state);
+        cancel_scan_impl(&state);
+        assert!(!stale.load(Ordering::Relaxed), "the orphaned flag from the previous scan must be untouched");
+        assert!(current.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cancel_scan_impl_is_a_harmless_no_op_when_no_scan_has_run() {
+        let state = ScanState::default();
+        cancel_scan_impl(&state); // must not panic
+    }
+
+    /// Exercises `dirwalk::scan` wired the same way `scan_dirs` wires it (minus the actual
+    /// `tauri::ipc::Channel`, which can't be constructed outside a running app) -- a real,
+    /// if partial, integration check that the app crate's plumbing (PathBuf conversion,
+    /// ScanOptions construction, the registered cancel flag) actually reaches dirwalk correctly.
+    #[test]
+    fn scan_dirs_wiring_reaches_dirwalk_and_reports_a_real_difference() {
+        let base = std::env::temp_dir().join(format!("diffgrid-test-{}-scan-dirs-wiring", std::process::id()));
+        let (left, right) = (base.join("left"), base.join("right"));
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::create_dir_all(&right).unwrap();
+        std::fs::write(left.join("only-left.txt"), "x").unwrap();
+
+        let state = ScanState::default();
+        let cancel = register_new_scan(&state);
+        let options = dirwalk::ScanOptions { respect_gitignore: true, exclude_globs: vec![] };
+        let mut entries = Vec::new();
+        let outcome = dirwalk::scan(&left, &right, &options, &cancel, |batch| entries.extend(batch));
+
+        assert!(!outcome.cancelled);
+        assert!(entries.iter().any(|e| e.path == "only-left.txt" && e.status == dirwalk::EntryStatus::LeftOnly));
+        std::fs::remove_dir_all(&base).ok();
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -376,10 +530,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(SessionState::default())
+        .manage(ScanState::default())
         .invoke_handler(tauri::generate_handler![
             diff_fixture, fixture_text, report_ready, report_bench, report_error, bench_flags,
             open_file_pair, open_file_text, launch_args, intra_line_spans, apply_edit, redo_diff,
-            save_file
+            save_file, path_kind, scan_dirs, cancel_scan
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
