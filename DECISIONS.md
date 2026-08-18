@@ -198,3 +198,47 @@ here rather than leaving it as an unremarked deviation from the approved design.
 Word-level highlighting would need a different segmentation than the current prefix/suffix trim
 (word-boundary-aware diffing, not raw UTF-16-unit trimming) — treat it as new work, not a trivial
 mode flag on the existing function.
+
+## 2026-08-18 — Hunk apply/revert exposed via toolbar acting on the current hunk, not inline gutter buttons
+
+**Decision**: M2's "apply/revert individual hunks left↔right" (docs/PLAN.md) ships as two toolbar
+buttons ("← Copy to left" / "Copy to right →") that act on whichever hunk the existing Prev/Next
+diff navigation has selected, rather than a button/arrow rendered inline in the gutter next to
+each individual hunk.
+
+**Why**: the brief specifies the *capability*, not the UI placement. Per-hunk inline controls
+would need a new CM6 decoration/widget layer purely for the buttons themselves (on top of the
+existing line-highlight, padding, collapse, and intra-line-mark decorations already layered over
+these documents), which is a materially larger and more failure-prone piece of work than reusing
+navigation state that already exists and is already tested. Toolbar-driven copy is a complete,
+usable version of the feature; inline per-hunk buttons are a polish item, not a correctness gap.
+
+**Implementation note worth keeping**: the copy itself is *not* a new backend command. It's built
+as a single CM6 `{from, to, insert}` change (`buildHunkCopyChange` in `diffView.ts`) dispatched on
+the destination pane's `EditorView`, which flows through the exact same `onEdit` → `apply_edit` →
+debounced `redo_diff` pipeline a keystroke would. `posAfterLine` mapping a hunk's `{start, len}`
+line range to a *character* range is what makes one formula handle all three hunk kinds and both
+directions (an `Insert`/`Delete` hunk has `len === 0` on one side, which the same formula turns
+into an empty destination range — a pure insertion — or an empty source range — a deletion —
+without any hunk-kind-specific branching).
+
+**How to apply**: don't special-case `Insert`/`Delete` hunks in any future change to this code
+path; the empty-range behavior of `posAfterLine` is what keeps them unified with `Replace`. If
+inline per-hunk gutter buttons are ever added, they should call the same `buildHunkCopyChange` +
+dispatch-on-destination-view mechanism, not a parallel implementation.
+
+**Selection after a copy**: `currentHunk` resets to `-1` after any hunk copy, the same as after a
+toggle or any other edit that invalidates the hunk list — chosen instead of trying to re-point at
+"the same" hunk post-copy, since the copied hunk usually disappears and every hunk after it can
+shift position. Consistent behavior across every hunks-invalidating event beats a bespoke
+re-selection heuristic that would only apply to this one path.
+
+**Real bug this caught, not a hypothetical**: the first version of this wiring crashed
+(`TypeError: undefined is not an object (evaluating 's.kind')`) on the very first hunk-copy click
+after a fresh file open, because `runRealFiles` set `changeLines` directly instead of going
+through `applyNewHunks` (which is what actually populates `currentChangeHunks`, the array
+`copyCurrentHunk` indexes into) — `currentChangeHunks` stayed `[]` until the first toggle or edit
+had triggered a real re-diff. No unit test caught this, since none of them exercise
+`runRealFiles`'s real `invoke()` calls end-to-end; it was only caught by manually clicking through
+the feature under Xvfb. Fixed by having `runRealFiles` call `applyNewHunks` directly instead of
+duplicating a subset of what it does.
