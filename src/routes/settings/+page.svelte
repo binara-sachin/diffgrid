@@ -14,6 +14,12 @@
   onMount(async () => {
     settings = await invoke<Settings>("load_settings");
     loaded = true;
+    window.addEventListener("error", (e) => {
+      invoke("report_error", { message: `settings window.onerror: ${e.message}` });
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      invoke("report_error", { message: `settings unhandledrejection: ${String(e.reason)}` });
+    });
   });
 
   // Persists on every change (no explicit Save button, matching the mockup's live-toggle
@@ -29,6 +35,8 @@
     { value: "word", label: "Word" },
     { value: "character", label: "Character" },
   ];
+
+  const contextLineOptions = [0, 1, 3, 5, 10, 20];
 </script>
 
 <main>
@@ -54,7 +62,11 @@
       <div class="row-title">Collapse unchanged regions</div>
       <div class="row-desc">Keep this many context lines around every change</div>
     </div>
-    <input type="number" min="0" max="50" bind:value={settings.collapseContextLines} onchange={persist} class="number-input" />
+    <select bind:value={settings.collapseContextLines} onchange={persist} class="context-select">
+      {#each contextLineOptions as n (n)}
+        <option value={n}>{n} {n === 1 ? "line" : "lines"}</option>
+      {/each}
+    </select>
   </div>
 
   <div class="row">
@@ -106,8 +118,7 @@
     color: #888;
     margin-top: 2px;
   }
-  .number-input {
-    width: 60px;
+  .context-select {
     padding: 4px 6px;
     font-size: 13px;
   }
