@@ -23,6 +23,7 @@
     type EditDelta,
   } from "$lib/diffView";
   import type { DirEntry, FileDiffResult, Hunk, OpenPairResult, ScanOutcome, Span } from "$lib/types";
+  import { visibleDirEntries as visibleDirEntriesFn } from "$lib/dirView";
 
   const FIXTURE = "100k-line-pair";
   const SCROLL_BENCH_DELAY_MS = 2000;
@@ -62,7 +63,11 @@
   let dirScanning = $state(false);
   let dirScanOutcome: ScanOutcome | null = $state(null);
   let hideIdentical = $state(true);
-  const visibleDirEntries = $derived(hideIdentical ? dirEntries.filter((e) => e.status !== "same") : dirEntries);
+  // Entries arrive in scan order (and the left-only tail is HashMap iteration order, so it's not
+  // even deterministic run to run) -- visibleDirEntries (tested in dirView.test.ts) sorts by path
+  // so the table is actually usable for finding a specific file, matching the
+  // flat-table-is-a-complete-capability scope call in DECISIONS.md.
+  const visibleDirEntries = $derived(visibleDirEntriesFn(dirEntries, hideIdentical));
 
   // Populated by runRealFiles; read by retoggleDiffOptions and hunk navigation. leftView/
   // rightView aren't read in the template, so plain variables suffice; changeLines and
@@ -457,9 +462,31 @@
     mode = "dirs";
     status = "scanning…";
 
+    // A large tree streams thousands of small batches. Applying each straight to `dirEntries`
+    // forces a full re-sort + keyed DOM reorder of an unvirtualized table on every single one --
+    // real, unbounded redundant work as entry count grows. Coalescing into at most one flush per
+    // animation frame bounds that to the display refresh rate regardless of how fast batches
+    // arrive. NOT verified to be sufficient by itself to keep Cancel reliably clickable on very
+    // large trees (see DECISIONS.md) -- that investigation's own A/B tests came back too
+    // confounded by this scan's two-phase design (phase 1 streams zero rows, so a click's landing
+    // odds depend heavily on which phase it happens to land in) to isolate cause and effect. This
+    // is kept because it's a strict improvement with no downside, not because it was proven to
+    // fix the large-scale case on its own.
+    let pendingEntries: DirEntry[] = [];
+    let flushHandle: number | null = null;
+    const flush = () => {
+      flushHandle = null;
+      if (pendingEntries.length === 0) return;
+      dirEntries = [...dirEntries, ...pendingEntries];
+      pendingEntries = [];
+    };
+
     const channel = new Channel<DirEntry[]>();
     channel.onmessage = (batch) => {
-      dirEntries = [...dirEntries, ...batch];
+      pendingEntries.push(...batch);
+      if (flushHandle === null) {
+        flushHandle = requestAnimationFrame(flush);
+      }
     };
 
     try {
@@ -470,6 +497,8 @@
         excludeGlobs: [],
         channel,
       });
+      if (flushHandle !== null) cancelAnimationFrame(flushHandle);
+      flush();
       dirScanOutcome = outcome;
       status = outcome.cancelled ? `scan cancelled — ${dirEntries.length} entries found before stopping` : "ready";
     } catch (e) {
