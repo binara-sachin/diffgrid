@@ -17,6 +17,7 @@ import {
   computeMinimapSegments,
   computeViewportIndicator,
   minimapClickToLine,
+  type EditDelta,
 } from "./diffView";
 import type { Hunk, Span } from "./types";
 
@@ -258,13 +259,89 @@ describe("updateHunks", () => {
     const fetchSpans = async (): Promise<Span[]> => [{ side: "left", startUtf16: 0, lenUtf16: 1 }];
     const parent = document.createElement("div");
     document.body.appendChild(parent);
-    const view = createDiffEditor(parent, text, hunks, "left", false, { otherDoc, fetchSpans });
+    const view = createDiffEditor(parent, text, hunks, "left", false, { getOtherDoc: () => otherDoc, fetchSpans });
 
     await new Promise((r) => setTimeout(r, 10)); // let the initial intra-line fetch resolve
     expect(view.dom.querySelectorAll(".diff-intra").length).toBeGreaterThan(0);
 
     updateHunks(view, [{ kind: "equal", left: { start: 0, len: 3 }, right: { start: 0, len: 3 } }]);
     expect(view.dom.querySelectorAll(".diff-intra").length).toBe(0);
+    view.destroy();
+  });
+});
+
+describe("createDiffEditor editable mode / onEdit", () => {
+  it("is read-only by default (no onEdit hook fires, since editable defaults to false)", () => {
+    const captured: EditDelta[] = [];
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    // editable/onEdit both omitted -- matches every M0/M1 call site unchanged.
+    const view = createDiffEditor(parent, "abc", [], "left");
+    expect(view.state.readOnly).toBe(true);
+    view.destroy();
+    expect(captured).toEqual([]);
+  });
+
+  it("captures a real edit as a delta with correct UTF-16 offsets", () => {
+    const captured: EditDelta[] = [];
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const view = createDiffEditor(parent, "abc", [], "left", false, undefined, false, true, (deltas) => captured.push(...deltas));
+    expect(view.state.readOnly).toBe(false);
+    view.dispatch({ changes: { from: 1, to: 2, insert: "XY" } }); // replace "b" with "XY"
+    expect(captured).toEqual([{ fromUtf16: 1, toUtf16: 2, inserted: "XY" }]);
+    view.destroy();
+  });
+
+  /// Regression guard for the exact echo bug the collaborating advisor review flagged: a
+  /// decoration-only transaction (here, the same `setHunks` effect a whitespace/case-ignore
+  /// toggle or a debounced re-diff dispatches) carries no `changes`, so `update.docChanged`
+  /// must stay false and `onEdit` must never fire for it. If this regresses, a hunk refresh
+  /// would get misread as a user edit and re-applied to the Rust-side shadow buffer, silently
+  /// corrupting it -- the corruption wouldn't surface until a later save wrote wrong bytes.
+  it("does not treat a decoration-only setHunks dispatch as an edit", () => {
+    // Counts calls, not just accumulated deltas: an effects-only transaction has zero changes
+    // to iterate regardless of whether the docChanged guard exists, so a test that only checks
+    // "no deltas captured" would pass even if the guard were deleted and onEdit were called
+    // with an empty array every time. Only a call-count assertion actually exercises the guard.
+    let callCount = 0;
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const hunks: Hunk[] = [{ kind: "equal", left: { start: 0, len: 1 }, right: { start: 0, len: 1 } }];
+    const view = createDiffEditor(parent, "a\n", hunks, "left", false, undefined, false, true, () => {
+      callCount++;
+    });
+    updateHunks(view, hunks);
+    expect(callCount).toBe(0);
+    view.destroy();
+  });
+
+  it("shifts later deltas in a multi-change batch by the net length change of earlier ones", () => {
+    const captured: EditDelta[] = [];
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const view = createDiffEditor(parent, "abcdef", [], "left", false, undefined, false, true, (deltas) => captured.push(...deltas));
+    // one transaction, two non-overlapping changes specified against the *original* document:
+    // insert "XY" at position 1, and replace [4,5) ("e") with "Z".
+    view.dispatch({ changes: [{ from: 1, to: 1, insert: "XY" }, { from: 4, to: 5, insert: "Z" }] });
+    expect(view.state.doc.toString()).toBe("aXYbcdZf");
+    // applying these sequentially to a fresh buffer must reproduce the same result: after the
+    // first delta the buffer is "aXYbcdef", so the second delta's position must be shifted by
+    // +2 (the net length "XY" added) to still land on "e" rather than on the original offsets.
+    expect(captured).toEqual([
+      { fromUtf16: 1, toUtf16: 1, inserted: "XY" },
+      { fromUtf16: 6, toUtf16: 7, inserted: "Z" },
+    ]);
+    view.destroy();
+  });
+
+  it("captures a pure deletion as an empty insert", () => {
+    const captured: EditDelta[] = [];
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    const view = createDiffEditor(parent, "abc", [], "left", false, undefined, false, true, (deltas) => captured.push(...deltas));
+    view.dispatch({ changes: { from: 1, to: 2, insert: "" } });
+    expect(captured).toEqual([{ fromUtf16: 1, toUtf16: 2, inserted: "" }]);
     view.destroy();
   });
 });

@@ -18,31 +18,47 @@
     type ChangeHunkLine,
     type MinimapSegment,
     type ViewportIndicator,
+    type EditDelta,
   } from "$lib/diffView";
   import type { FileDiffResult, OpenPairResult, Span } from "$lib/types";
 
   const FIXTURE = "100k-line-pair";
   const SCROLL_BENCH_DELAY_MS = 2000;
   const SCROLL_BENCH_DURATION_MS = 4000;
+  // M2: how long to wait after the last keystroke on either pane before re-diffing. Per
+  // docs/PLAN.md §2 this must be debounced, not per-keystroke -- a live re-diff on every
+  // character would mean a Rust round-trip (plus a full histogram diff) on every keystroke,
+  // which is exactly the per-keystroke cost the delta pipeline exists to avoid elsewhere.
+  const EDIT_REDIFF_DEBOUNCE_MS = 300;
 
   let status = $state("loading…");
   let statLine = $state("");
   let isRealFileMode = $state(false);
   let ignoreWhitespace = $state(false);
   let ignoreCase = $state(false);
+  let dirtyLeft = $state(false);
+  let dirtyRight = $state(false);
 
   // Populated by runRealFiles; read by retoggleDiffOptions and hunk navigation. leftView/
-  // rightView/leftText/rightText aren't read in the template, so plain variables suffice;
-  // changeLines and currentHunk are, so they need $state for the toolbar to update.
+  // rightView aren't read in the template, so plain variables suffice; changeLines and
+  // currentHunk are, so they need $state for the toolbar to update.
   let leftView: EditorView | undefined;
   let rightView: EditorView | undefined;
-  let leftText = "";
-  let rightText = "";
   let changeLines: ChangeHunkLine[] = $state([]);
   let currentHunk = $state(-1);
   let minimapSegments: MinimapSegment[] = $state([]);
   let viewportIndicator: ViewportIndicator = $state({ topFrac: 0, heightFrac: 1 });
   let totalLines = 0;
+
+  // M2's edit pipeline: apply_edit calls for a given side must land at Rust in the exact order
+  // CM6 produced them (each one's offsets are only valid against the buffer state the previous
+  // one left behind) even though `invoke` is async and its IPC round-trip could otherwise let
+  // calls resolve out of order. Chaining each call onto a per-side promise means the next one
+  // is only *issued* once the previous one's response has come back, without blocking typing
+  // itself (nothing here awaits these chains except the debounced re-diff, below).
+  let editQueueLeft: Promise<void> = Promise.resolve();
+  let editQueueRight: Promise<void> = Promise.resolve();
+  let redoDiffTimer: ReturnType<typeof setTimeout> | undefined;
 
   function applyNewHunks(hunks: FileDiffResult["hunks"]) {
     if (!leftView || !rightView) return;
@@ -50,6 +66,9 @@
     updateHunks(rightView, hunks);
     changeLines = changeHunkLines(hunks);
     currentHunk = -1;
+    // Refreshed here, not just at open: an edit can add or remove lines, so a re-diff's hunk
+    // list may no longer match the line count the minimap was last computed against.
+    totalLines = leftView.state.doc.lines;
     minimapSegments = computeMinimapSegments(hunks, totalLines);
   }
 
@@ -65,18 +84,60 @@
     scrollToLine(leftView, minimapClickToLine((e.clientY - rect.top) / rect.height, totalLines));
   }
 
+  /**
+   * Re-diffs against the Rust-side `EditBuffer`s' *current* text (which reflects any edits
+   * applied via `apply_edit` since open, not just the text as it was when the file was opened)
+   * with the current whitespace/case-ignore toggles. Replaces M1's `diff_texts`, which sent
+   * `leftText`/`rightText` from the frontend on every call -- once edits exist, holding a
+   * frontend copy of "the text" at all just invites sending a stale one, so the toggle path and
+   * the edit-re-diff path now share one mechanism with one source of truth.
+   *
+   * Awaits both edit queues first so a re-diff (whether from a toggle click or the debounced
+   * timer below) never races an `apply_edit` call that's still in flight for the same edit.
+   */
+  async function flushAndRedoDiff(): Promise<FileDiffResult> {
+    await Promise.all([editQueueLeft, editQueueRight]);
+    const diff = await invoke<FileDiffResult>("redo_diff", { ignoreWhitespace, ignoreCase });
+    applyNewHunks(diff.hunks);
+    statLine = `+${diff.stats.added} -${diff.stats.removed} ${diff.stats.chunks} chunks`;
+    return diff;
+  }
+
   async function retoggleDiffOptions() {
     if (!leftView || !rightView) return;
     status = "re-diffing…";
-    const diff = await invoke<FileDiffResult>("diff_texts", {
-      left: leftText,
-      right: rightText,
-      ignoreWhitespace,
-      ignoreCase,
-    });
-    applyNewHunks(diff.hunks);
-    statLine = `+${diff.stats.added} -${diff.stats.removed} ${diff.stats.chunks} chunks`;
+    await flushAndRedoDiff();
     status = "ready";
+  }
+
+  function scheduleDebouncedRedoDiff() {
+    if (redoDiffTimer !== undefined) clearTimeout(redoDiffTimer);
+    redoDiffTimer = setTimeout(() => {
+      redoDiffTimer = undefined;
+      flushAndRedoDiff().catch((err) => invoke("report_error", { message: `redo_diff: ${err}` }));
+    }, EDIT_REDIFF_DEBOUNCE_MS);
+  }
+
+  /**
+   * The frontend -> Rust half of docs/PLAN.md §2's delta pipeline: forwards each delta CM6
+   * captured to the matching `EditBuffer`, then (debounced) triggers a re-diff. `side` is fixed
+   * per call site (see `runRealFiles`), not derived from the delta, since `EditDelta` itself
+   * carries no side information -- it's purely a CM6-document-relative offset pair.
+   */
+  function onEdit(side: "left" | "right", deltas: EditDelta[]) {
+    if (side === "left") dirtyLeft = true;
+    else dirtyRight = true;
+    for (const delta of deltas) {
+      const send = (): Promise<void> =>
+        invoke<void>("apply_edit", { side, fromUtf16: delta.fromUtf16, toUtf16: delta.toUtf16, inserted: delta.inserted }).catch(
+          (err) => {
+            invoke("report_error", { message: `apply_edit(${side}): ${err}` });
+          },
+        );
+      if (side === "left") editQueueLeft = editQueueLeft.then(send);
+      else editQueueRight = editQueueRight.then(send);
+    }
+    scheduleDebouncedRedoDiff();
   }
 
   function goToHunk(direction: 1 | -1) {
@@ -121,9 +182,10 @@
   });
 
   /**
-   * M1's real entry point: `diffgrid FILE1 FILE2`. Unlike `runSpike`, this never runs the
+   * M1/M2's real entry point: `diffgrid FILE1 FILE2`. Unlike `runSpike`, this never runs the
    * synthetic scroll benchmark or the `disablePadding` A/B toggle — those are M0
-   * measurement-harness concerns, not part of the real application.
+   * measurement-harness concerns, not part of the real application. M2 adds: both panes
+   * editable, edits forwarded to Rust's `EditBuffer`s, debounced re-diff.
    */
   async function runRealFiles(left: string, right: string) {
     status = "diffing…";
@@ -133,10 +195,15 @@
       invoke<ArrayBuffer>("open_file_text", { path: right }),
     ]);
 
-    leftText = new TextDecoder().decode(leftBuf);
-    rightText = new TextDecoder().decode(rightBuf);
-    const leftDoc = Text.of(leftText.split("\n"));
-    const rightDoc = Text.of(rightText.split("\n"));
+    const leftText = new TextDecoder().decode(leftBuf);
+    const rightText = new TextDecoder().decode(rightBuf);
+    // Only a fallback for the brief window during construction below where the *other* side's
+    // EditorView doesn't exist yet (its own intra-line highlighter can synchronously schedule
+    // its first fetch from inside `new EditorView(...)`, before this function has assigned
+    // `rightView`/`leftView`) -- not used once both views exist, since `getOtherDoc` below reads
+    // the live view's current document past that point, including edits.
+    const leftDocAtOpen = Text.of(leftText.split("\n"));
+    const rightDocAtOpen = Text.of(rightText.split("\n"));
 
     const fetchSpans = (leftLine: string, rightLine: string) =>
       invoke<Span[]>("intra_line_spans", { leftLine, rightLine, ignoreWhitespace, ignoreCase });
@@ -151,8 +218,10 @@
       result.diff.hunks,
       "left",
       false,
-      { otherDoc: rightDoc, fetchSpans, onFetchError },
+      { getOtherDoc: () => (rightView ? rightView.state.doc : rightDocAtOpen), fetchSpans, onFetchError },
       true,
+      true,
+      (deltas) => onEdit("left", deltas),
     );
     rightView = createDiffEditor(
       rightEl,
@@ -160,12 +229,14 @@
       result.diff.hunks,
       "right",
       false,
-      { otherDoc: leftDoc, fetchSpans, onFetchError },
+      { getOtherDoc: () => (leftView ? leftView.state.doc : leftDocAtOpen), fetchSpans, onFetchError },
       true,
+      true,
+      (deltas) => onEdit("right", deltas),
     );
     syncScroll(leftView, rightView);
     isRealFileMode = true;
-    totalLines = leftDoc.lines;
+    totalLines = leftDocAtOpen.lines;
     changeLines = changeHunkLines(result.diff.hunks);
     currentHunk = -1;
     minimapSegments = computeMinimapSegments(result.diff.hunks, totalLines);
