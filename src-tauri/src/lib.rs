@@ -1,6 +1,27 @@
 use std::path::PathBuf;
+use std::sync::Mutex;
 use serde::Serialize;
+use session::EditBuffer;
 use tauri::ipc::Response;
+
+/// M2's in-memory edit state for the single open file pair (per docs/PLAN.md §5 — no session
+/// shell/multi-tab yet, so exactly one left/right pair). `None` before any file is opened (the
+/// M0 benchmark flow never populates this). A plain `Mutex`, not `RwLock`: every access either
+/// mutates (`apply_edit`, `open_file_pair`) or needs a consistent snapshot across both sides
+/// (`redo_diff`, `save_file`), so there's no read-heavy case that would benefit from a
+/// reader/writer split.
+#[derive(Default)]
+struct SessionState {
+    left: Mutex<Option<EditBuffer>>,
+    right: Mutex<Option<EditBuffer>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Side {
+    Left,
+    Right,
+}
 
 #[derive(Serialize)]
 struct BenchFlags {
@@ -76,12 +97,21 @@ fn diff_pair(left_bytes: &[u8], right_bytes: &[u8]) -> Result<OpenPairResult, St
 
 /// M1: `diffgrid FILE1 FILE2` real-file entry point (see `launch_args`). Reads both files,
 /// runs binary refusal + encoding/line-ending detection via `text-io`, then diffs the
-/// normalized text. No editing, no directories yet — that's M2/M3.
+/// normalized text. M2: also seeds `SessionState` with a fresh `EditBuffer` per side (holding
+/// the raw bytes just read, for an exact-byte-identical unedited save — see `EditBuffer`),
+/// replacing whatever was open before. Still a single file pair, no directories/session shell.
 #[tauri::command]
-fn open_file_pair(left: String, right: String) -> Result<OpenPairResult, String> {
+fn open_file_pair(state: tauri::State<SessionState>, left: String, right: String) -> Result<OpenPairResult, String> {
     let left_bytes = std::fs::read(&left).map_err(|e| format!("{left}: {e}"))?;
     let right_bytes = std::fs::read(&right).map_err(|e| format!("{right}: {e}"))?;
-    diff_pair(&left_bytes, &right_bytes)
+    let result = diff_pair(&left_bytes, &right_bytes)?;
+
+    let left_loaded = text_io::load(&left_bytes);
+    let right_loaded = text_io::load(&right_bytes);
+    *state.left.lock().unwrap() = Some(EditBuffer::new(&left_loaded.normalized, left_bytes, left_loaded.meta));
+    *state.right.lock().unwrap() = Some(EditBuffer::new(&right_loaded.normalized, right_bytes, right_loaded.meta));
+
+    Ok(result)
 }
 
 /// Companion to `open_file_pair`: the normalized (BOM-stripped, LF-normalized) full text of
@@ -120,13 +150,71 @@ fn intra_line_spans(
     )
 }
 
-/// Re-diffs two already-loaded, already-normalized texts with whitespace/case-ignore toggles
-/// applied, per docs/PLAN.md's M1 feature list. Takes text rather than a path so a toggle
-/// change doesn't re-read the file from disk — the frontend already has both texts in memory
-/// from `open_file_pair`/`open_file_text` at open time.
+/// Core of `apply_edit`, taking a plain `&SessionState` rather than `tauri::State` so it's
+/// callable from unit tests without a running app (`tauri::State` has no public constructor —
+/// same rationale as `diff_pair` being split out from its `#[tauri::command]` wrapper above).
+fn apply_edit_impl(state: &SessionState, side: Side, from_utf16: u32, to_utf16: u32, inserted: &str) -> Result<(), String> {
+    let mutex = match side {
+        Side::Left => &state.left,
+        Side::Right => &state.right,
+    };
+    let mut guard = mutex.lock().unwrap();
+    let buffer = guard.as_mut().ok_or("no file open on this side")?;
+    buffer.apply_delta(from_utf16, to_utf16, inserted)
+}
+
+/// Applies one edit delta captured from a CM6 transaction to the corresponding side's
+/// `EditBuffer` — the frontend → Rust half of the delta pipeline in docs/PLAN.md §2. Errors if
+/// no file pair is open yet, or if the offsets are malformed (see `EditBuffer::apply_delta`).
+///
+/// Caller contract: deltas from a single side must be sent in the order CM6 produced them, and
+/// each call's `from_utf16`/`to_utf16` must be valid against the buffer state left by the
+/// previous call — never issued concurrently for the same side, or the shadow buffer diverges
+/// from CM6's real document silently (a divergence that only surfaces later, as a bad save).
 #[tauri::command]
-fn diff_texts(left: String, right: String, ignore_whitespace: bool, ignore_case: bool) -> diff_core::FileDiffResult {
-    diff_core::diff_lines_with_options(&left, &right, diff_core::DiffOptions { ignore_whitespace, ignore_case })
+fn apply_edit(state: tauri::State<SessionState>, side: Side, from_utf16: u32, to_utf16: u32, inserted: String) -> Result<(), String> {
+    apply_edit_impl(&state, side, from_utf16, to_utf16, &inserted)
+}
+
+fn redo_diff_impl(state: &SessionState, ignore_whitespace: bool, ignore_case: bool) -> Result<diff_core::FileDiffResult, String> {
+    let left = state.left.lock().unwrap().as_ref().ok_or("no file open on the left")?.text();
+    let right = state.right.lock().unwrap().as_ref().ok_or("no file open on the right")?.text();
+    Ok(diff_core::diff_lines_with_options(&left, &right, diff_core::DiffOptions { ignore_whitespace, ignore_case }))
+}
+
+/// Re-diffs the two open `EditBuffer`s' *current* text (i.e. including any edits applied via
+/// `apply_edit` since open) with whitespace/case-ignore toggles applied. Replaces M1's
+/// `diff_texts(left, right, ...)`, which took the text as parameters from the frontend — once
+/// editing exists, the frontend's own copy of the text can be stale the moment an edit lands,
+/// so the Rust-side `EditBuffer` (kept current by `apply_edit`) must be the one source of truth
+/// for what gets diffed, for the live-toggle case and the post-edit case alike.
+#[tauri::command]
+fn redo_diff(state: tauri::State<SessionState>, ignore_whitespace: bool, ignore_case: bool) -> Result<diff_core::FileDiffResult, String> {
+    redo_diff_impl(&state, ignore_whitespace, ignore_case)
+}
+
+fn save_file_impl(state: &SessionState, side: Side, path: &str) -> Result<(), String> {
+    let mutex = match side {
+        Side::Left => &state.left,
+        Side::Right => &state.right,
+    };
+    let mut guard = mutex.lock().unwrap();
+    let buffer = guard.as_mut().ok_or("no file open on this side")?;
+    let bytes = buffer.to_bytes()?;
+    std::fs::write(path, &bytes).map_err(|e| format!("{path}: {e}"))?;
+    buffer.mark_saved(bytes);
+    Ok(())
+}
+
+/// Writes the current state of one side's `EditBuffer` to `path`, encoding/line-ending-preserving
+/// per docs/PLAN.md §2: an unedited buffer writes back its exact original bytes; an edited one
+/// re-encodes into the original encoding/line-ending style (see `text_io::to_bytes`). On success,
+/// the buffer adopts the just-written bytes as its new baseline (`EditBuffer::mark_saved`), so a
+/// later unedited save short-circuits again instead of re-encoding every time regardless of
+/// whether anything changed since the last save.
+#[tauri::command]
+fn save_file(state: tauri::State<SessionState>, side: Side, path: String) -> Result<(), String> {
+    save_file_impl(&state, side, &path)
 }
 
 /// Argv (excluding argv[0]) as handed to the process. `diffgrid FILE1 FILE2` is M1's real
@@ -201,15 +289,84 @@ mod tests {
         assert_eq!(result.diff.stats.chunks, 0, "identical content under different encodings should diff as equal");
         assert_eq!(result.right_meta.encoding, text_io::Encoding::Utf16Le);
     }
+
+    fn opened_state(left: &str, right: &str) -> SessionState {
+        let left_loaded = text_io::load(left.as_bytes());
+        let right_loaded = text_io::load(right.as_bytes());
+        SessionState {
+            left: Mutex::new(Some(EditBuffer::new(&left_loaded.normalized, left.as_bytes().to_vec(), left_loaded.meta))),
+            right: Mutex::new(Some(EditBuffer::new(&right_loaded.normalized, right.as_bytes().to_vec(), right_loaded.meta))),
+        }
+    }
+
+    /// Exercises the exact sequence the frontend's edit pipeline relies on: an edit lands via
+    /// `apply_edit`, then `redo_diff` must see it -- i.e. it reads the *current* `EditBuffer`
+    /// text, not a snapshot from open time. This is the invariant the whole shadow-buffer
+    /// design in docs/PLAN.md §2 rests on.
+    #[test]
+    fn redo_diff_reflects_an_edit_applied_since_open() {
+        let state = opened_state("a\nb\nc\n", "a\nb\nc\n");
+        let diff = redo_diff_impl(&state, false, false).unwrap();
+        assert_eq!(diff.stats.chunks, 0, "no edits yet -- must still diff as identical");
+
+        apply_edit_impl(&state, Side::Left, 2, 3, "X").unwrap();
+        let diff = redo_diff_impl(&state, false, false).unwrap();
+        assert_eq!(diff.stats.chunks, 1, "the edit must be visible to a re-diff without re-sending text from the frontend");
+    }
+
+    #[test]
+    fn redo_diff_honors_ignore_whitespace_after_an_edit() {
+        let state = opened_state("a\nfoo\nc\n", "a\nfoo\nc\n");
+        apply_edit_impl(&state, Side::Right, 6, 6, "   ").unwrap();
+        let diff = redo_diff_impl(&state, true, false).unwrap();
+        assert_eq!(diff.stats.chunks, 0, "a whitespace-only edit must not count as a hunk under ignore_whitespace");
+    }
+
+    #[test]
+    fn apply_edit_errors_when_no_file_is_open_on_that_side() {
+        let state = SessionState::default();
+        let err = apply_edit_impl(&state, Side::Left, 0, 0, "x").unwrap_err();
+        assert!(err.contains("no file open"));
+    }
+
+    #[test]
+    fn save_file_writes_original_bytes_verbatim_when_unedited() {
+        let state = opened_state("a\r\nb\r\nc\r\n", "a\nb\nc\n"); // left is CRLF
+        let dir = std::env::temp_dir().join(format!("diffgrid-test-{}-a", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("left.txt");
+        save_file_impl(&state, Side::Left, path.to_str().unwrap()).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(written, b"a\r\nb\r\nc\r\n", "an unedited save must reproduce the original CRLF bytes exactly");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_file_reencodes_and_marks_clean_after_an_edit() {
+        let state = opened_state("a\nb\nc\n", "a\nb\nc\n");
+        apply_edit_impl(&state, Side::Left, 0, 1, "X").unwrap();
+        let dir = std::env::temp_dir().join(format!("diffgrid-test-{}-b", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("left.txt");
+        save_file_impl(&state, Side::Left, path.to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"X\nb\nc\n");
+        // a second save with no further edits must now short-circuit to *these* bytes, not
+        // silently re-diverge -- i.e. mark_saved really updated the baseline.
+        save_file_impl(&state, Side::Left, path.to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"X\nb\nc\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(SessionState::default())
         .invoke_handler(tauri::generate_handler![
             diff_fixture, fixture_text, report_ready, report_bench, report_error, bench_flags,
-            open_file_pair, open_file_text, launch_args, intra_line_spans, diff_texts
+            open_file_pair, open_file_text, launch_args, intra_line_spans, apply_edit, redo_diff,
+            save_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
