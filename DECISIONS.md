@@ -583,3 +583,48 @@ character mode for non-Latin text. A consequence worth knowing before "fixing" i
 directly adjacent to letters with no separator (e.g. "😀bc") merges into *one* token with them,
 not two -- exercising this required correcting a test whose own expectation didn't match the
 tokenizer's deliberate design, not a bug in the tokenizer itself.
+
+## 2026-08-18 — M4 sidebar: a real nested/collapsible directory tree, not the flat list M3 shipped
+
+**Decision**: the sidebar's CHANGED FILES panel now renders a real nested tree (`buildDirTree` /
+`pruneDirTree` / `flattenDirTree` in `src/lib/dirView.ts`) with per-folder expand/collapse state
+(`collapsedDirPaths`, a `Set<string>` of collapsed folder paths, default empty = all expanded),
+replacing the flat sorted-by-path table M3 shipped and M3's own DECISIONS.md entry explicitly
+deferred this work to.
+
+**Why now, when the actual mockup (`docs/UI/ui-01.png`) shows a flat list**: this milestone's own
+scoping question surfaced a real conflict between two sources that both matter here --
+`docs/PLAN.md` names the M4 deliverable "sidebar **tree**," and M3's DECISIONS.md entry commits
+in its own words to "a collapsible/expandable directory tree with per-directory expand/collapse
+state" being M4's job specifically. The mockup screenshot, by contrast, only ever shows a small,
+shallow fixture (7 changed files, 2 levels deep) where a flat list and a tree would render
+identically -- it's not strong evidence the design *intends* a flat list at real scale, just that
+the fixture never exercised the difference. Asked directly, the call was to honor the two written
+commitments (PLAN.md's wording, M3's own deferral note) over an ambiguous mockup rather than
+silently reinterpret both away from what they say.
+
+**Implementation shape**: `buildDirTree` groups the flat `DirEntry[]` `scan_dirs` already streams
+by splitting `path` on `/` — a pure frontend transform, exactly as M3's DECISIONS.md "How to
+apply" note specified, no scan-logic change. A folder is synthesized (`isDir: true, entry: null`)
+wherever a path implies an intermediate directory that was never itself scanned as its own
+`DirEntry`. `pruneDirTree` keeps a folder whenever *any* descendant survives `hideIdentical`, even
+if the folder itself is `same` — otherwise an unmodified folder containing one modified file would
+vanish along with its only visible child. `flattenDirTree` is a depth-first walk producing the
+row list actually rendered, skipping a folder's children when its path is in `collapsedPaths`.
+
+**What's proven vs. not**: unit-tested (15 new tests in `dirView.test.ts`) — tree grouping, folder
+synthesis, alphabetical sort per level, prune-keeps-ancestor / prune-drops-empty-folder, collapse
+suppressing children, and depth/hasChildren row metadata. Visually verified under Xvfb against a
+real synthetic tree (`src/lib/{a,b}.ts`, `src/ui/pane.tsx`, `README.md`, 3 of 4 files modified):
+correct indentation and disclosure triangles, `b.ts` (unchanged) correctly hidden under
+`hideIdentical` while its unmodified parent folders `src/`/`lib/` correctly stay visible as
+ancestors of modified descendants, clicking a folder row collapses/re-expands it and the
+CHANGED FILES count updates to only the still-visible file rows, and the previously-missing
+selected-row highlight (light blue) now shows correctly on an open tab's sidebar row.
+
+**Not built**: a changed-line-count column per file (mockup shows one, e.g. "compare.ts ... 20")
+— `DirEntry` only carries `sizeLeft`/`sizeRight` (bytes), not a diff-derived line count, so this
+isn't a pure frontend transform like the tree grouping was; it would need either a cheap
+line-count-only diff per changed file during the scan (a real scan-side cost this milestone hasn't
+measured) or computing it lazily on first sidebar render. Left as a documented gap rather than
+silently building a wrong/fake number.

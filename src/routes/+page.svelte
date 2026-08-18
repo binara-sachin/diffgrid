@@ -24,7 +24,7 @@
     type EditDelta,
   } from "$lib/diffView";
   import type { DiffStats, DirEntry, FileDiffResult, Hunk, OpenPairResult, ScanOutcome, Settings, Span } from "$lib/types";
-  import { visibleDirEntries as visibleDirEntriesFn } from "$lib/dirView";
+  import { visibleDirTreeRows, type DirTreeRow } from "$lib/dirView";
   import { createTabId, tabLabel } from "$lib/tabs";
 
   const FIXTURE = "100k-line-pair";
@@ -61,11 +61,21 @@
   let dirScanning = $state(false);
   let dirScanOutcome: ScanOutcome | null = $state(null);
   let hideIdentical = $state(true);
+  // Folder paths currently collapsed (children hidden) in the sidebar tree -- a folder not in
+  // this set renders expanded, matching a fresh scan's all-expanded default. Plain (non-$state)
+  // Set mutated in place and reassigned to itself to trigger reactivity, since Svelte 5's proxy
+  // wrapping doesn't observe Set.add/delete by reference alone.
+  let collapsedDirPaths: Set<string> = $state(new Set());
   // Entries arrive in scan order (and the left-only tail is HashMap iteration order, so it's not
-  // even deterministic run to run) -- visibleDirEntries (tested in dirView.test.ts) sorts by path
-  // so the table is actually usable for finding a specific file, matching the
-  // flat-table-is-a-complete-capability scope call in DECISIONS.md.
-  const visibleDirEntries = $derived(visibleDirEntriesFn(dirEntries, hideIdentical));
+  // even deterministic run to run) -- visibleDirTreeRows (tested in dirView.test.ts) groups them
+  // into a real nested tree, sorted by name at each level, per PLAN.md's M4 "sidebar tree."
+  const dirTreeRows = $derived(visibleDirTreeRows(dirEntries, hideIdentical, collapsedDirPaths));
+
+  function toggleDirCollapsed(path: string) {
+    if (collapsedDirPaths.has(path)) collapsedDirPaths.delete(path);
+    else collapsedDirPaths.add(path);
+    collapsedDirPaths = new Set(collapsedDirPaths);
+  }
 
   /**
    * M4's per-tab reactive UI state -- one `FileTab` per open file-pair tab. Deliberately holds
@@ -629,11 +639,12 @@
    * A row is only meaningful to open as a two-way text diff when both sides are actual regular
    * files with real content to compare -- a directory (its "Same"/"Modified" status already
    * says nothing about its children, which have their own rows), a symlink (diffing two link
-   * *targets* as text is a different, unimplemented feature), or a LeftOnly/RightOnly/
-   * TypeConflict entry (no meaningful "other side" to diff against) are all excluded.
+   * *targets* as text is a different, unimplemented feature), a synthesized folder row with no
+   * `DirEntry` of its own, or a LeftOnly/RightOnly/TypeConflict entry (no meaningful "other side"
+   * to diff against) are all excluded.
    */
-  function isOpenable(entry: DirEntry): boolean {
-    return !entry.isDir && !entry.isSymlink && (entry.status === "same" || entry.status === "modified");
+  function isOpenable(entry: DirEntry | null): entry is DirEntry {
+    return entry !== null && !entry.isDir && !entry.isSymlink && (entry.status === "same" || entry.status === "modified");
   }
 
   /**
@@ -643,7 +654,7 @@
    * Code's Source Control view) already use rather than a wordy status column this sidebar's
    * width can't accommodate alongside the path.
    */
-  function statusSigil(status: DirEntry["status"]): string {
+  function statusSigil(status: DirEntry["status"] | undefined): string {
     switch (status) {
       case "modified":
         return "~";
@@ -665,7 +676,6 @@
    * the same pair, which is never what a user wants from a tabbed UI.
    */
   async function openRowAsFilePair(entry: DirEntry) {
-    if (!isOpenable(entry)) return;
     const left = `${dirLeftRoot}/${entry.path}`;
     const right = `${dirRightRoot}/${entry.path}`;
     const existing = tabs.find((t) => t.leftPath === left && t.rightPath === right);
@@ -674,6 +684,16 @@
       return;
     }
     await openFileTab(left, right);
+  }
+
+  /** A tree row's click handler: a folder toggles its own expand/collapse state, an openable
+   * file opens it as a tab -- one dispatch point so the template doesn't need its own branching. */
+  function onDirTreeRowClick(row: DirTreeRow) {
+    if (row.isDir) {
+      toggleDirCollapsed(row.path);
+    } else if (isOpenable(row.entry)) {
+      openRowAsFilePair(row.entry);
+    }
   }
 </script>
 
@@ -698,18 +718,26 @@
           </label>
         </div>
         <div class="sidebar-header">
-          CHANGED FILES · {visibleDirEntries.length}
+          CHANGED FILES · {dirTreeRows.filter((r) => !r.isDir).length}
           {dirScanOutcome?.cancelled ? " (cancelled)" : ""}
         </div>
         <div class="dir-table-wrap">
           <table class="dir-table">
             <tbody>
-              {#each visibleDirEntries as entry (entry.path)}
+              {#each dirTreeRows as row (row.path)}
                 <!-- svelte-ignore a11y_click_events_have_key_events -->
                 <!-- svelte-ignore a11y_no_static_element_interactions -->
-                <tr class="status-{entry.status}" class:openable={isOpenable(entry)} onclick={() => openRowAsFilePair(entry)}>
-                  <td class="sigil">{statusSigil(entry.status)}</td>
-                  <td>{entry.path}{entry.isDir ? "/" : ""}</td>
+                <tr
+                  class="status-{row.entry?.status ?? 'same'}"
+                  class:openable={isOpenable(row.entry)}
+                  class:folder={row.isDir}
+                  class:selected={isOpenable(row.entry) && activeTab?.leftPath === `${dirLeftRoot}/${row.path}` && activeTab?.rightPath === `${dirRightRoot}/${row.path}`}
+                  onclick={() => onDirTreeRowClick(row)}
+                >
+                  <td class="tree-indent" style="width: {row.depth * 14}px"></td>
+                  <td class="disclosure">{row.isDir ? (collapsedDirPaths.has(row.path) ? "▸" : "▾") : ""}</td>
+                  <td class="sigil">{row.isDir ? "" : statusSigil(row.entry?.status)}</td>
+                  <td>{row.name}{row.isDir ? "/" : ""}</td>
                 </tr>
               {/each}
             </tbody>
@@ -1038,16 +1066,32 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .dir-table td.tree-indent {
+    padding: 0;
+  }
+  .dir-table td.disclosure {
+    width: 1em;
+    padding-right: 0;
+    color: #888;
+  }
   .dir-table td.sigil {
     width: 1em;
     padding-right: 0;
     font-weight: bold;
   }
-  .dir-table tr.openable {
+  .dir-table tr.openable,
+  .dir-table tr.folder {
     cursor: pointer;
   }
-  .dir-table tr.openable:hover {
+  .dir-table tr.openable:hover,
+  .dir-table tr.folder:hover {
     background: #eef4ff;
+  }
+  .dir-table tr.selected {
+    background: #d6e6ff;
+  }
+  .dir-table tr.folder {
+    font-weight: 600;
   }
   .dir-table tr.status-modified {
     color: #9a6700;
