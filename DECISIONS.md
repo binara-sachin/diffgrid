@@ -242,3 +242,55 @@ had triggered a real re-diff. No unit test caught this, since none of them exerc
 `runRealFiles`'s real `invoke()` calls end-to-end; it was only caught by manually clicking through
 the feature under Xvfb. Fixed by having `runRealFiles` call `applyNewHunks` directly instead of
 duplicating a subset of what it does.
+
+## 2026-08-18 — `redo_diff` held two locks sequentially instead of together (caught by review, not tests)
+
+**Bug**: `redo_diff_impl`'s first version read `state.left.lock().unwrap().as_ref()...text()` and
+`state.right.lock().unwrap().as_ref()...text()` as two separate statements/expressions. Each
+temporary lock guard is dropped at the end of its own statement, so there was a real gap between
+releasing the left lock and acquiring the right one. Tauri commands aren't guaranteed to run
+serialized, so a concurrent `apply_edit` on either side landing in that gap would make `redo_diff`
+diff a left snapshot from time T against a right snapshot from time T+1 -- producing a
+`FileDiffResult` whose `LineRange`s don't correspond to either pane's actual content. That result
+then feeds directly into `buildCollapseRanges`/`spansToMarkRanges` on the frontend, the same
+"metadata silently stops matching the text it describes" failure class as the earlier UTF-16 and
+serde bugs, just from a torn read instead of a wire-format mismatch.
+
+**Fix**: bind both lock guards to variables first, then read both `.text()` values while both are
+held (see `redo_diff_impl`). Always locks left before right; nothing else in `src-tauri/src/lib.rs`
+locks both sides at once, so this can't deadlock against another caller locking in the opposite
+order.
+
+**Why this wasn't caught by the existing test suite, and won't get a regression test either**: the
+race window is a handful of CPU instructions between two lock acquisitions. Reliably forcing a
+real interleaving there in a test would need either a production-code test-only synchronization
+hook (bad: changes shipped code for testability) or a probabilistic thread-timing test (bad: the
+kind of flaky test that erodes trust in the suite and might not even reproduce the failure
+reliably in CI). This was caught by code review reasoning about lock scope, not by running
+anything -- noted here explicitly rather than pretending a test covers it. If this class of bug
+recurs, the tool to reach for is a model checker (e.g. `loom`) over a hand-rolled timing test.
+
+**How to apply**: any future function that needs a consistent view across `state.left` and
+`state.right` together must acquire both guards before reading either side, the same way. A
+single `state.left.lock()...` expression is fine when only one side is touched (see `apply_edit`,
+`save_file`), but never when a value derived from `left` and a value derived from `right` need to
+describe the *same instant*.
+
+## 2026-08-18 — Unsaved edits are silently discarded on window close; no confirmation guard yet
+
+**Gap, not an oversight**: M2 makes both panes editable and tracks a dirty flag per side, but
+nothing consults `dirtyLeft`/`dirtyRight` when the window closes -- a user can edit, close the
+window, and lose the changes with no prompt. This is a real data-loss gap in shipped M2 behavior,
+being written down explicitly rather than left as an unremarked hole (same treatment as the
+Off/Word/Character mockup gap above).
+
+**Why not fixed now**: a close-confirmation dialog is naturally part of M4's session shell (the
+unified window that owns app-level lifecycle, settings, and multi-file state) -- M2 has no
+"session" concept yet, just a single always-open file pair with no window-management layer to
+hook a beforeunload-style guard into in a way that wouldn't be thrown away when M4 replaces this
+window structure anyway.
+
+**How to apply**: when M4's session shell is built, add a close guard that checks `dirtyLeft`/
+`dirtyRight` (or their session-shell equivalents) before allowing the window to close, prompting
+to save/discard/cancel. Until then, do not represent M2 as data-loss-safe -- users editing real
+files should be told to save explicitly before closing.
