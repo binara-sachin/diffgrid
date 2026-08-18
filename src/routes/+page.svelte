@@ -3,7 +3,17 @@
   import { invoke } from "@tauri-apps/api/core";
   import { Text } from "@codemirror/state";
   import type { EditorView } from "@codemirror/view";
-  import { createDiffEditor, syncScroll, updateHunks, runScrollBenchmark } from "$lib/diffView";
+  import {
+    createDiffEditor,
+    syncScroll,
+    updateHunks,
+    runScrollBenchmark,
+    changeHunkLines,
+    nextHunkIndex,
+    prevHunkIndex,
+    scrollToLine,
+    type ChangeHunkLine,
+  } from "$lib/diffView";
   import type { FileDiffResult, OpenPairResult, Span } from "$lib/types";
 
   const FIXTURE = "100k-line-pair";
@@ -16,12 +26,23 @@
   let ignoreWhitespace = $state(false);
   let ignoreCase = $state(false);
 
-  // Populated by runRealFiles; read by retoggleDiffOptions. Not reactive state -- these never
-  // change independently of a full re-open, so plain module-scoped variables are enough.
+  // Populated by runRealFiles; read by retoggleDiffOptions and hunk navigation. leftView/
+  // rightView/leftText/rightText aren't read in the template, so plain variables suffice;
+  // changeLines and currentHunk are, so they need $state for the toolbar to update.
   let leftView: EditorView | undefined;
   let rightView: EditorView | undefined;
   let leftText = "";
   let rightText = "";
+  let changeLines: ChangeHunkLine[] = $state([]);
+  let currentHunk = $state(-1);
+
+  function applyNewHunks(hunks: FileDiffResult["hunks"]) {
+    if (!leftView || !rightView) return;
+    updateHunks(leftView, hunks);
+    updateHunks(rightView, hunks);
+    changeLines = changeHunkLines(hunks);
+    currentHunk = -1;
+  }
 
   async function retoggleDiffOptions() {
     if (!leftView || !rightView) return;
@@ -32,10 +53,15 @@
       ignoreWhitespace,
       ignoreCase,
     });
-    updateHunks(leftView, diff.hunks);
-    updateHunks(rightView, diff.hunks);
+    applyNewHunks(diff.hunks);
     statLine = `+${diff.stats.added} -${diff.stats.removed} ${diff.stats.chunks} chunks`;
     status = "ready";
+  }
+
+  function goToHunk(direction: 1 | -1) {
+    if (!leftView || changeLines.length === 0) return;
+    currentHunk = direction === 1 ? nextHunkIndex(changeLines.length, currentHunk) : prevHunkIndex(changeLines.length, currentHunk);
+    scrollToLine(leftView, changeLines[currentHunk].left);
   }
 
   function doubleRaf(): Promise<void> {
@@ -48,6 +74,16 @@
     });
     window.addEventListener("unhandledrejection", (e) => {
       invoke("report_error", { message: `unhandledrejection: ${String(e.reason)}` });
+    });
+    window.addEventListener("keydown", (e) => {
+      if (!e.altKey || !isRealFileMode) return;
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        goToHunk(1);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        goToHunk(-1);
+      }
     });
     try {
       const args = await invoke<string[]>("launch_args");
@@ -108,6 +144,8 @@
     );
     syncScroll(leftView, rightView);
     isRealFileMode = true;
+    changeLines = changeHunkLines(result.diff.hunks);
+    currentHunk = -1;
 
     statLine = `+${result.diff.stats.added} -${result.diff.stats.removed} ${result.diff.stats.chunks} chunks`;
     status = "ready";
@@ -156,6 +194,9 @@
   <div class="stat">{statLine}</div>
   {#if isRealFileMode}
     <div class="toolbar">
+      <button onclick={() => goToHunk(-1)} disabled={changeLines.length === 0}>&uarr; Prev diff</button>
+      <button onclick={() => goToHunk(1)} disabled={changeLines.length === 0}>&darr; Next diff</button>
+      <span class="hunk-count">{changeLines.length === 0 ? "no changes" : `${currentHunk + 1} / ${changeLines.length}`}</span>
       <label>
         <input type="checkbox" bind:checked={ignoreWhitespace} onchange={retoggleDiffOptions} />
         Ignore whitespace
@@ -206,6 +247,22 @@
     align-items: center;
     gap: 4px;
     cursor: pointer;
+  }
+  .toolbar button {
+    font-size: 12px;
+    background: #444;
+    color: #ddd;
+    border: 1px solid #555;
+    border-radius: 3px;
+    padding: 2px 6px;
+    cursor: pointer;
+  }
+  .toolbar button:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+  .hunk-count {
+    color: #999;
   }
   .panes {
     flex: 1 1 auto;

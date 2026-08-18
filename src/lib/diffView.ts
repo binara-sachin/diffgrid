@@ -354,6 +354,38 @@ export function buildCollapseDecorations(doc: Text, hunks: Hunk[], side: "left" 
   return builder.finish();
 }
 
+export interface ChangeHunkLine {
+  left: number;
+  right: number;
+}
+
+/** First line of each non-equal hunk, in document order — the ordered stop list for hunk
+ * navigation (`nextHunkIndex`/`prevHunkIndex`). */
+export function changeHunkLines(hunks: Hunk[]): ChangeHunkLine[] {
+  return hunks.filter((h) => h.kind !== "equal").map((h) => ({ left: h.left.start + 1, right: h.right.start + 1 }));
+}
+
+/** Wraps forward through `[0, count)`; `-1` (nothing selected yet) advances to the first hunk.
+ * `count === 0` (no changes at all) returns `-1` in both directions — there is nothing to go to. */
+export function nextHunkIndex(count: number, current: number): number {
+  if (count === 0) return -1;
+  return (current + 1) % count;
+}
+
+export function prevHunkIndex(count: number, current: number): number {
+  if (count === 0) return -1;
+  if (current === -1) return count - 1; // nothing selected yet -> start from the end
+  return (current - 1 + count) % count;
+}
+
+/** Scrolls a hunk's start line to the vertical center of the viewport. Only needs to be called
+ * on one pane — `syncScroll` mirrors the resulting scrollTop to the other. */
+export function scrollToLine(view: EditorView, lineNo: number): void {
+  if (lineNo < 1 || lineNo > view.state.doc.lines) return;
+  const pos = view.state.doc.line(lineNo).from;
+  view.dispatch({ effects: EditorView.scrollIntoView(pos, { y: "center" }) });
+}
+
 export function createDiffEditor(
   parent: HTMLElement,
   text: string,
