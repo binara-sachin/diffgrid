@@ -83,3 +83,24 @@ few specific to the new features:
   disable-padding one from M0) are Linux-verified only; re-run both on macOS if the padding/
   collapse mechanism is ever revisited, since the "block-level decorations trigger a slow layout
   mode" finding they're built on was itself only characterized against WebKitGTK.
+
+## M2 features (editing) verified only on Linux/WebKitGTK/Xvfb
+
+No new `process.platform`/`cfg(target_os)` branches here either. Manually verified under Xvfb
+with `xdotool`: typing an edit and seeing the debounced re-diff land correctly (including a
+line-count-changing insert, which re-triggers alignment padding); saving a CRLF-encoded file and
+confirming the on-disk bytes both contain the edit and keep CRLF; per-hunk copy for a `Replace`
+hunk and an `Insert` hunk, including the dirty-flag and minimap updates. None of this exercises
+anything WebKitGTK-specific by construction, but none of it has been *seen* running under WKWebView
+either — same caveat as M1's collapse/minimap rendering above.
+
+**Cmd/Ctrl+S** checks `e.ctrlKey || e.metaKey`, matching the same DOM-level Alt-key caveat M1's
+hunk-navigation shortcuts already carry: `metaKey` should map to Cmd on macOS per spec, not
+verified on real hardware.
+
+**Unedited-save byte-identity is the one correctness property most worth re-checking on macOS**:
+`EditBuffer::to_bytes()` short-circuits to the exact original bytes when the buffer isn't dirty,
+which is what makes a UTF-8-BOM or `Mixed`-line-ending file round-trip losslessly through an
+open→save with no edits. This is pure Rust logic with no platform dependency, but it's the kind of
+thing worth a real spot-check with a real macOS-authored file (e.g. one saved by Xcode or another
+Mac-native editor) rather than assuming the Linux-generated test fixtures are representative.

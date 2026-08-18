@@ -5,10 +5,12 @@ architecture, module boundaries, and milestone breakdown. `docs/M0-RESULTS.md` /
 `docs/PROFILING.md` cover the feasibility spike and the performance investigation that fixed the
 scroll/paint regression found there (now shipped — see the `perf:` commit in `git log`).
 
-**Status: M1 complete** — two-way, read-only file diffing (`diffgrid FILE1 FILE2`): encoding/
+**Status: M2 complete** — two-way file diff with editing (`diffgrid FILE1 FILE2`): encoding/
 line-ending/binary detection, histogram line diff, lazy intra-line highlighting, live whitespace/
-case-ignore toggles, collapsed unchanged regions, hunk navigation, and a minimap overview strip.
-No editing (M2), no directories (M3), no session shell (M4) yet.
+case-ignore toggles, collapsed unchanged regions, hunk navigation, a minimap overview strip, both
+panes editable with debounced live re-diff, per-side save (encoding/line-ending-preserving), and
+per-hunk apply/revert (copy either side's version of a hunk onto the other). No directories (M3),
+no session shell (M4) yet.
 
 Stack: Rust core (histogram diff via `imara-diff`) + Tauri shell + CodeMirror 6 frontend.
 
@@ -63,11 +65,14 @@ npm run tauri dev
 target/release/app FILE1 FILE2
 ```
 
-Opens a real two-way, read-only diff: encoding/line-ending detection, histogram line diff, lazy
-intra-line highlighting, live whitespace/case-ignore toggles, collapsed unchanged regions,
-Prev/Next-diff navigation (buttons or Alt+Up/Alt+Down), and a minimap overview strip. Binary
-files are refused with an error rather than diffed. There's no file picker yet (M4's session
-shell) and no editing (M2) — this is M1's read-only file-pair view.
+Opens a real two-way diff: encoding/line-ending detection, histogram line diff, lazy intra-line
+highlighting, live whitespace/case-ignore toggles, collapsed unchanged regions, Prev/Next-diff
+navigation (buttons or Alt+Up/Alt+Down), and a minimap overview strip. Binary files are refused
+with an error rather than diffed. Both panes are editable: typing debounces (~300ms) into a live
+re-diff, "Copy to left"/"Copy to right" apply the currently-navigated hunk's content to the other
+side, and "Save left"/"Save right" (or Cmd/Ctrl+S while a pane is focused) write back to the
+original file, preserving its original encoding and line-ending style. There's no file picker yet
+(M4's session shell) and no directory comparison (M3) — this is M1+M2's single-file-pair view.
 
 Running the binary with **no arguments** instead launches the M0 benchmark flow: it loads the
 100k-line synthetic fixture, renders the dual-pane diff, then runs a self-contained
