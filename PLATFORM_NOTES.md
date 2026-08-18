@@ -64,3 +64,22 @@ WKWebView is hardware-accelerated by default. This affects every fps/paint-time 
 repo's history, not just one metric — treat all of them as directional until re-measured on the
 actual M4 Pro target, per the M0 gate's own stated next step (still open, not resolved by this
 pass).
+
+## M1 features verified only on Linux/WebKitGTK/Xvfb — no new platform-conditional code, but check visually
+
+M1 (real two-way file diff) added no new `process.platform`/`cfg(target_os)` branches — the
+`ensureDisplay()` one above is still the only one in the repo. Everything below was built using
+the same CM6/WebKitGTK stack the M0 fixes already depend on, so the same caveats apply, plus a
+few specific to the new features:
+
+- **Collapsed-region and minimap rendering** were only screenshot-verified under Xvfb. Check on
+  macOS that the `.diff-collapse` placeholder and the minimap's colored segments/viewport
+  rectangle render with the same proportions — nothing here is Linux-specific by construction,
+  but nothing here has been *seen* rendered by WKWebView either.
+- **Alt+Up/Alt+Down hunk-navigation shortcuts** use `KeyboardEvent.altKey`, which should map to
+  the Option key on macOS per the DOM spec — not verified on real macOS hardware. If it doesn't,
+  the Prev/Next diff buttons are an unaffected fallback (same `goToHunk` call).
+- **The intra-line-diff and collapse A/B probes** (`bench/m0-spike.mjs --collapse-equal`, the
+  disable-padding one from M0) are Linux-verified only; re-run both on macOS if the padding/
+  collapse mechanism is ever revisited, since the "block-level decorations trigger a slow layout
+  mode" finding they're built on was itself only characterized against WebKitGTK.
