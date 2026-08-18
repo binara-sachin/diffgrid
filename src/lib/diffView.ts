@@ -168,17 +168,20 @@ function mainDecorationsField(side: "left" | "right", disablePadding: boolean, c
 /**
  * CM6 extension applying character-level highlight marks to `Replace`-hunk lines, fetched
  * lazily per docs/PLAN.md §6 as they scroll into view rather than eagerly for the whole file.
- * `otherDoc` is the opposite pane's document — needed because a line pair's spans depend on
- * both sides' text, not just this pane's own. `otherDoc` itself is fixed at construction (no
- * side's *text* can change yet — that's M2's editing feature), but the hunk list can, via a
- * dispatched `setHunks` effect (a whitespace/case-ignore toggle re-diffing the same text) —
- * the cache is keyed by line-number pairs, which point at different content once hunks change,
- * so it's invalidated whenever that happens rather than only tracking viewport changes.
+ * `getOtherDoc` returns the opposite pane's *current* document — needed because a line pair's
+ * spans depend on both sides' text, not just this pane's own. It's a live accessor rather than
+ * a `Text` snapshot captured once at construction: M2 makes both panes editable, so the other
+ * side's document can change after this highlighter is created, and a captured snapshot would
+ * silently go stale the moment the other pane is edited (same failure shape as the earlier
+ * `Span` serde bug — wrong output with no error at the boundary). The hunk list can also change,
+ * via a dispatched `setHunks` effect (a toggle or an edit re-diffing the text) — the cache is
+ * keyed by line-number pairs, which point at different content once hunks change, so it's
+ * invalidated whenever that happens rather than only tracking viewport changes.
  */
 export function intraLineHighlighter(
   initialHunks: Hunk[],
   side: "left" | "right",
-  otherDoc: Text,
+  getOtherDoc: () => Text,
   fetchSpans: SpansFetcher,
   onFetchError?: (message: string) => void,
 ) {
@@ -231,10 +234,19 @@ export function intraLineHighlighter(
       schedule(view: EditorView) {
         const fromLine = view.state.doc.lineAt(view.viewport.from).number;
         const toLine = view.state.doc.lineAt(view.viewport.to).number;
+        const otherDoc = getOtherDoc();
         for (const pair of replaceLinePairsInRange(hunks, side, fromLine, toLine)) {
           const key = `${pair.leftLine}:${pair.rightLine}`;
           if (cache.has(key) || pending.has(key)) continue;
+          // `hunks` can briefly lag behind either pane's *current* document while an edit on
+          // either side is mid-flight (the debounced re-diff hasn't landed and dispatched a
+          // fresh `setHunks` yet) -- skip a pair a stale hunk list points past the end of
+          // either document instead of throwing, since the upcoming `setHunks` will invalidate
+          // this cache entry and reschedule against the corrected hunk list anyway.
           if (pair.leftLine > view.state.doc.lines && side === "left") continue;
+          if (pair.rightLine > view.state.doc.lines && side === "right") continue;
+          if (pair.leftLine > otherDoc.lines && side === "right") continue;
+          if (pair.rightLine > otherDoc.lines && side === "left") continue;
           pending.add(key);
           const leftText = side === "left" ? view.state.doc.line(pair.leftLine).text : otherDoc.line(pair.leftLine).text;
           const rightText = side === "right" ? view.state.doc.line(pair.rightLine).text : otherDoc.line(pair.rightLine).text;
@@ -434,14 +446,49 @@ export function minimapClickToLine(clickFrac: number, totalLines: number): numbe
   return Math.max(1, Math.min(totalLines, line));
 }
 
+/** One CM6 change, in the UTF-16-offset delta shape the IPC boundary uses (docs/PLAN.md §3).
+ * `fromUtf16`/`toUtf16` are positions in the document as it stood immediately before this delta
+ * — i.e. valid against the Rust-side `EditBuffer` only if every prior delta (from this same
+ * batch or an earlier one) has already been applied to it, in order. */
+export interface EditDelta {
+  fromUtf16: number;
+  toUtf16: number;
+  inserted: string;
+}
+
+/**
+ * Decomposes one CM6 update into the ordered list of `EditDelta`s the Rust-side `EditBuffer`
+ * needs, per docs/PLAN.md §2's "incremental deltas, never a full-document resend" constraint.
+ *
+ * `update.changes.iterChanges` yields each change's `fromA`/`toA` relative to the *original*
+ * pre-update document — correct for the first change in the batch, but not for the second and
+ * later ones once the first has been (conceptually) applied. Since deltas are applied to the
+ * Rust rope one at a time and in order, each one after the first needs its position shifted by
+ * the net length change every earlier delta *in this same batch* already introduced (its
+ * inserted length minus its deleted length) — otherwise the second delta in a multi-change
+ * keystroke (e.g. autocomplete replacing a selection, or two simultaneous cursors) would land
+ * at the wrong offset against a rope that's already been mutated by the first.
+ */
+export function editDeltasFromUpdate(update: ViewUpdate): EditDelta[] {
+  const deltas: EditDelta[] = [];
+  let shift = 0;
+  update.changes.iterChanges((fromA, toA, fromB, toB, insertedText) => {
+    deltas.push({ fromUtf16: fromA + shift, toUtf16: toA + shift, inserted: insertedText.toString() });
+    shift += (toB - fromB) - (toA - fromA);
+  });
+  return deltas;
+}
+
 export function createDiffEditor(
   parent: HTMLElement,
   text: string,
   hunks: Hunk[],
   side: "left" | "right",
   disablePadding = false,
-  intraLine?: { otherDoc: Text; fetchSpans: SpansFetcher; onFetchError?: (message: string) => void },
+  intraLine?: { getOtherDoc: () => Text; fetchSpans: SpansFetcher; onFetchError?: (message: string) => void },
   collapseEqual = false,
+  editable = false,
+  onEdit?: (deltas: EditDelta[]) => void,
 ): EditorView {
   const doc = Text.of(text.split("\n"));
   const field = mainDecorationsField(side, disablePadding, collapseEqual);
@@ -452,10 +499,21 @@ export function createDiffEditor(
       lineNumbers(),
       keymap.of(defaultKeymap),
       javascript(),
-      EditorState.readOnly.of(true),
+      EditorState.readOnly.of(!editable),
       field.init(() => computeMainDecorations(doc, hunks, side, disablePadding, collapseEqual)),
       ...(intraLine
-        ? intraLineHighlighter(hunks, side, intraLine.otherDoc, intraLine.fetchSpans, intraLine.onFetchError)
+        ? intraLineHighlighter(hunks, side, intraLine.getOtherDoc, intraLine.fetchSpans, intraLine.onFetchError)
+        : []),
+      // Guarded on `docChanged`, which is false for the decoration-only transactions `setHunks`/
+      // `setIntraLineDecorations` dispatch (they carry effects, not changes) -- without this
+      // guard, applying a hunk-refresh or intra-line-highlight update would be misread as a
+      // user edit and echoed back to Rust, corrupting the shadow buffer silently (it wouldn't
+      // throw; it would just make a later save write the wrong bytes).
+      ...(editable && onEdit
+        ? [EditorView.updateListener.of((update: ViewUpdate) => {
+            if (!update.docChanged) return;
+            onEdit!(editDeltasFromUpdate(update));
+          })]
         : []),
       EditorView.theme({
         "&": { height: "100%", fontSize: "13px" },
