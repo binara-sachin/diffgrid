@@ -5,12 +5,14 @@ architecture, module boundaries, and milestone breakdown. `docs/M0-RESULTS.md` /
 `docs/PROFILING.md` cover the feasibility spike and the performance investigation that fixed the
 scroll/paint regression found there (now shipped — see the `perf:` commit in `git log`).
 
-**Status: M2 complete** — two-way file diff with editing (`diffgrid FILE1 FILE2`): encoding/
-line-ending/binary detection, histogram line diff, lazy intra-line highlighting, live whitespace/
-case-ignore toggles, collapsed unchanged regions, hunk navigation, a minimap overview strip, both
-panes editable with debounced live re-diff, per-side save (encoding/line-ending-preserving), and
-per-hunk apply/revert (copy either side's version of a hunk onto the other). No directories (M3),
-no session shell (M4) yet.
+**Status: M3 complete** — two-way file diff with editing (`diffgrid FILE1 FILE2`) and directory
+comparison (`diffgrid DIR1 DIR2`). Files: encoding/line-ending/binary detection, histogram line
+diff, lazy intra-line highlighting, live whitespace/case-ignore toggles, collapsed unchanged
+regions, hunk navigation, a minimap overview strip, both panes editable with debounced live
+re-diff, per-side save (encoding/line-ending-preserving), and per-hunk apply/revert. Directories:
+recursive gitignore-aware cancellable scan, tiered size/mtime/content compare, a flat streamed
+results table with a hide-identical toggle, opening a row reuses the file-pair view. No session
+shell (M4) yet.
 
 Stack: Rust core (histogram diff via `imara-diff`) + Tauri shell + CodeMirror 6 frontend.
 
@@ -62,17 +64,27 @@ npm run tauri dev
 ## Run
 
 ```bash
-target/release/app FILE1 FILE2
+target/release/app FILE1 FILE2   # two-way file diff
+target/release/app DIR1 DIR2     # directory comparison
 ```
 
-Opens a real two-way diff: encoding/line-ending detection, histogram line diff, lazy intra-line
-highlighting, live whitespace/case-ignore toggles, collapsed unchanged regions, Prev/Next-diff
-navigation (buttons or Alt+Up/Alt+Down), and a minimap overview strip. Binary files are refused
-with an error rather than diffed. Both panes are editable: typing debounces (~300ms) into a live
-re-diff, "Copy to left"/"Copy to right" apply the currently-navigated hunk's content to the other
-side, and "Save left"/"Save right" (or Cmd/Ctrl+S while a pane is focused) write back to the
-original file, preserving its original encoding and line-ending style. There's no file picker yet
-(M4's session shell) and no directory comparison (M3) — this is M1+M2's single-file-pair view.
+**Files**: opens a real two-way diff — encoding/line-ending detection, histogram line diff, lazy
+intra-line highlighting, live whitespace/case-ignore toggles, collapsed unchanged regions,
+Prev/Next-diff navigation (buttons or Alt+Up/Alt+Down), and a minimap overview strip. Binary
+files are refused with an error rather than diffed. Both panes are editable: typing debounces
+(~300ms) into a live re-diff, "Copy to left"/"Copy to right" apply the currently-navigated hunk's
+content to the other side, and "Save left"/"Save right" (or Cmd/Ctrl+S while a pane is focused)
+write back to the original file, preserving its original encoding and line-ending style.
+
+**Directories**: recursively scans and compares two directory trees (`.gitignore`-aware,
+cancellable), streaming results into a flat table as they're found — path, status
+(same/modified/leftOnly/rightOnly/typeConflict), and size on each side. "Hide identical" filters
+the already-fetched list instantly, no re-scan. Clicking a row for a file present and unchanged
+or modified on both sides opens it in the file-pair view above; "Back to directory list" returns
+without re-scanning.
+
+There's no file picker yet and no unified session across multiple open pairs — that's M4's
+session shell.
 
 Running the binary with **no arguments** instead launches the M0 benchmark flow: it loads the
 100k-line synthetic fixture, renders the dual-pane diff, then runs a self-contained
@@ -112,10 +124,13 @@ and `PLATFORM_NOTES.md` before drawing conclusions from them.
 
 ```
 crates/diff-core/    Rust: histogram line diff (imara-diff), no UI/Tauri dependency
+crates/text-io/      Rust: encoding/line-ending/binary detection, save-time re-encoding
+crates/session/      Rust: EditBuffer (ropey shadow buffer) for the edit/save pipeline
+crates/dirwalk/      Rust: cancellable two-phase directory-pair scan (the ignore crate)
 src-tauri/           Tauri shell: commands/events wiring only, no diff logic
 src/                 SvelteKit frontend; src/lib/diffView.ts wires CodeMirror 6
-fixtures/            Deterministic synthetic diff fixtures (generated, not committed) +
-                     the generator script (committed)
+fixtures/            Deterministic synthetic diff/tree fixtures (generated, not committed) +
+                     the generator scripts (committed)
 bench/               Cross-platform benchmark harness
 docs/                Architecture plan, spike results, profiling report
 DECISIONS.md         Ambiguous calls made autonomously, with rationale

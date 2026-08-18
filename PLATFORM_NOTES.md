@@ -104,3 +104,36 @@ which is what makes a UTF-8-BOM or `Mixed`-line-ending file round-trip losslessl
 open→save with no edits. This is pure Rust logic with no platform dependency, but it's the kind of
 thing worth a real spot-check with a real macOS-authored file (e.g. one saved by Xcode or another
 Mac-native editor) rather than assuming the Linux-generated test fixtures are representative.
+
+## M3 (directory comparison): one real cross-platform correctness risk, not just an unverified caveat
+
+**APFS filename normalization could silently split one logical file into `LeftOnly` +
+`RightOnly`, and this cannot be exercised on Linux at all.** `dirwalk::relative_path` uses each
+tree's path bytes directly as the join key between the two sides -- correct on Linux, where the
+filesystem stores whatever byte sequence was given to it. APFS (macOS's default filesystem)
+normalizes filenames containing decomposable Unicode (accented characters, some CJK) to NFD form
+on disk, regardless of what form was used to create the file. If one side of a compared pair was
+populated by something that writes NFC-normalized names (common: files that crossed through a
+non-Mac tool, a git checkout with `core.precomposeunicode` off, an archive extracted by a
+non-Apple tool) and the other side has the same logical filename in NFD form, `relative_path`
+would produce two *different* strings for what a user considers the same file -- reported as a
+`LeftOnly`/`RightOnly` pair instead of a match. This is not a hypothetical extrapolation from a
+known OS difference; it's the exact failure mode Unicode-normalization-mismatch bugs take in
+every cross-platform tool that joins paths by raw bytes. **Verify on macOS**: create a paired
+directory tree containing at least one filename with a precomposed accented character (e.g.
+`café.txt`) on each side via different tools/methods, and confirm the scan reports it as `Same`/
+`Modified` rather than a spurious `LeftOnly` + `RightOnly` pair. If it reproduces, the fix is
+Unicode-normalizing both sides' relative paths to the same form (NFC, matching what most other
+tools assume) before using them as the join key -- not comparing raw bytes.
+
+**Everything else in M3 is unverified-but-not-expected-to-differ**, same caveat class as M1/M2's
+entries above: `ignore::WalkBuilder`'s `follow_links(false)`/`hidden(false)`/`require_git(false)`
+settings and the byte-comparison content-equality tier are all plain filesystem operations with
+no Linux-specific code path, but none of it has been *run* against APFS. The 50k-file first-rows
+measurement (~130ms first batch, ~260ms full scan; see the fixture-generator commit) was taken
+entirely on this sandbox's filesystem -- worth flagging specifically because this same sandbox's
+raw filesystem syscall overhead already proved unrepresentative once during this exact
+investigation (fixture *generation* itself, ~50k small file writes, took 14-16s of wall clock,
+almost all in `sys` time -- ordinary local disk I/O on real hardware shouldn't be anywhere near
+that slow for the same operation). Re-measure the scan timing on the real macOS target before
+trusting the ~130ms/~260ms numbers as anything but directional.

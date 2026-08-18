@@ -294,3 +294,72 @@ window structure anyway.
 `dirtyRight` (or their session-shell equivalents) before allowing the window to close, prompting
 to save/discard/cancel. Until then, do not represent M2 as data-loss-safe -- users editing real
 files should be told to save explicitly before closing.
+
+**Extended for M3**: opening a directory-scan row now makes re-running the file-pair view a
+real, reachable, in-process flow for the first time (`runRealFiles` previously ran exactly once
+per launch) -- this reintroduces the same unsaved-changes-discarded risk on two new paths
+("open another row", "back to directory list"), and this time it's cheap enough to actually
+fix rather than defer: `confirmDiscardIfDirty()` (a `window.confirm` guard) blocks both. The
+*window-close* case above is still open and still deferred to M4; this only covers navigation
+within the app while it stays running.
+
+## 2026-08-18 — M3's mtime fast path: a real, observed false-Same, not a hypothetical risk
+
+**What happened**: while manually verifying the directory-compare view under Xvfb, two files
+created moments apart by back-to-back shell `echo` commands (no delay between them) -- one
+containing `"old\n"`, the other `"new\n"`, same byte length -- were reported as `Same`. Checked
+directly: both files had byte-identical size (4) and identical mtime down to the timestamp
+`dirwalk` actually compares. This is `classify()`'s documented size+mtime fast path (see the
+dirwalk commit and its doc comments) doing exactly what it says it can do, caught in the act
+rather than only reasoned about in the abstract.
+
+**Why this is real, not a sandbox artifact**: a separate direct check (write a file, sleep 50ms,
+write another, compare `st_mtime_ns`) showed this filesystem *does* resolve mtimes with real
+sub-second precision -- a 50ms gap was clearly visible. The two `echo`-generated files landed on
+identical timestamps because there was *no* gap: two sequential, non-sleeping writes can land
+within whatever interval the OS's mtime clock source actually updates at, which is not
+necessarily as fine as the timestamp's nominal resolution. Any real workflow that touches paired
+files in a tight loop -- a build script, a test-fixture generator, a fast bulk copy -- can
+reproduce this, not just a synthetic demo.
+
+**Decision: ship the heuristic anyway, as already planned, but treat this as confirmation, not
+just a caveat.** The tradeoff was decided and endorsed before implementation (see the dirwalk
+commit): always content-comparing on a size match is correct but reads every same-sized file on
+every scan, which is what the `≤1s`/50k-file target is written against; the mtime fast path is
+what makes that target reachable at all (see the fixture-generator commit's measurement -- with
+the fast path defeated, the same 50k-file scan went from ~260ms to ~11s). A tool that's fast but
+occasionally reports a real difference as unchanged is still more useful than one that's
+unusably slow on large trees; rsync's own default "quick check" makes the identical bet.
+
+**What this means in practice, stated plainly**: `diffgrid DIR1 DIR2`'s directory list can say
+`Same` for a file pair that actually differs, with no visual distinction from a genuinely
+identical pair. Opening the row and viewing the real diff is unaffected (`open_file_pair` always
+does a real line-by-line diff regardless of what the directory scan's heuristic concluded) --
+the risk is purely that a user might never click into a file the summary told them was unchanged.
+
+**How to apply**: don't "fix" this by always content-comparing on a size match -- that trades
+away the exact performance property that was measured and is the point of the tiered design. If
+this ever needs to be more trustworthy than the current tradeoff allows, the right lever is a
+user-facing "thorough compare" mode (always hash/byte-compare, accept the slower scan) offered
+as an *option* alongside the fast default, not a silent change to what the default does.
+
+## 2026-08-18 — M3 ships a flat, sorted results table; a real collapsible tree is M4's job
+
+**Decision**: `diffgrid DIR1 DIR2`'s results view is a flat table of every `DirEntry` (one row
+per file/directory, full relative path as the label), not a collapsible/expandable tree widget
+with per-directory expand/collapse state.
+
+**Why**: `docs/PLAN.md` describes M3's scan mechanism as walking a "recursive tree," which is
+about how the *comparison* is computed, not a commitment to a specific results UI -- and
+`docs/PLAN.md`'s own M4 milestone explicitly owns "sidebar tree + tabs + toolbar... wrapping
+M1-M3 as one session," meaning a real tree widget is already scoped work for later, not an
+M3 gap. Building a second, throwaway tree-rendering implementation now (only to likely replace
+it when M4's sidebar tree arrives) would be wasted work in the same shape as the toolbar-vs-
+gutter-buttons call in M2's DECISIONS entry -- a real, complete, usable version of the required
+*capability* (compare two directory trees, see what differs, open a file) shipped now, with the
+nicer presentation layered on later rather than gating the milestone.
+
+**How to apply**: when M4's sidebar tree is built, it should consume the same `DirEntry` list
+`scan_dirs` already streams (path + status + size, full relative path as the join key) --
+grouping it into a tree is a pure frontend transform over data this milestone already produces
+correctly, not a scan-logic change.
