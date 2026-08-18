@@ -5,14 +5,17 @@ architecture, module boundaries, and milestone breakdown. `docs/M0-RESULTS.md` /
 `docs/PROFILING.md` cover the feasibility spike and the performance investigation that fixed the
 scroll/paint regression found there (now shipped — see the `perf:` commit in `git log`).
 
-**Status: M3 complete** — two-way file diff with editing (`diffgrid FILE1 FILE2`) and directory
-comparison (`diffgrid DIR1 DIR2`). Files: encoding/line-ending/binary detection, histogram line
-diff, lazy intra-line highlighting, live whitespace/case-ignore toggles, collapsed unchanged
-regions, hunk navigation, a minimap overview strip, both panes editable with debounced live
-re-diff, per-side save (encoding/line-ending-preserving), and per-hunk apply/revert. Directories:
-recursive gitignore-aware cancellable scan, tiered size/mtime/content compare, a flat streamed
-results table with a hide-identical toggle, opening a row reuses the file-pair view. No session
-shell (M4) yet.
+**Status: M4 complete** — one unified session window (`diffgrid FILE1 FILE2` or
+`diffgrid DIR1 DIR2`) wrapping M1-M3 in multi-tab form, plus persisted global preferences. Files:
+encoding/line-ending/binary detection, histogram line diff, lazy intra-line highlighting (off /
+word-level / character-level, global setting), live per-tab whitespace/case-ignore toggles,
+collapsed unchanged regions (context-line count configurable), hunk navigation, a minimap overview
+strip, both panes editable with debounced live re-diff, per-side save
+(encoding/line-ending-preserving), and per-hunk apply/revert. Directories: recursive
+gitignore-aware cancellable scan, tiered size/mtime/content compare, a real collapsible/expandable
+sidebar tree (not a flat table) with a hide-identical toggle, clicking a file opens it as a tab in
+the same window. Multiple file pairs can be open as tabs simultaneously, each with independent
+edit/dirty state; a settings window (gear icon) persists global preferences across launches.
 
 Stack: Rust core (histogram diff via `imara-diff`) + Tauri shell + CodeMirror 6 frontend.
 
@@ -77,14 +80,21 @@ content to the other side, and "Save left"/"Save right" (or Cmd/Ctrl+S while a p
 write back to the original file, preserving its original encoding and line-ending style.
 
 **Directories**: recursively scans and compares two directory trees (`.gitignore`-aware,
-cancellable), streaming results into a flat table as they're found — path, status
-(same/modified/leftOnly/rightOnly/typeConflict), and size on each side. "Hide identical" filters
-the already-fetched list instantly, no re-scan. Clicking a row for a file present and unchanged
-or modified on both sides opens it in the file-pair view above; "Back to directory list" returns
-without re-scanning.
+cancellable), streaming results into the sidebar as they're found — a real nested tree grouped by
+path, with per-folder expand/collapse state, status (same/modified/leftOnly/rightOnly/
+typeConflict) shown as a sigil + row color. "Hide identical" filters the already-fetched list
+instantly, no re-scan (an unmodified folder stays visible if any descendant survives the filter).
+Clicking a file row present and unchanged or modified on both sides opens it as a tab; clicking a
+folder row toggles its expand/collapse state. Multiple tabs can be open at once, each independent.
 
-There's no file picker yet and no unified session across multiple open pairs — that's M4's
-session shell.
+**Settings**: the gear icon (top-right of the status bar) opens a separate settings window —
+collapse-context-line count and intra-line highlight mode (off/word/character) are global,
+persisted to disk (`app_config_dir()/settings.json`) and applied live to newly-opened tabs; a
+tab's own whitespace/case-ignore toggles seed from the global default but are a per-tab override
+that never writes back.
+
+There's no file picker yet — launch args (or `git difftool`/`mergetool`, M6) are the only way to
+open a session.
 
 Running the binary with **no arguments** instead launches the M0 benchmark flow: it loads the
 100k-line synthetic fixture, renders the dual-pane diff, then runs a self-contained
