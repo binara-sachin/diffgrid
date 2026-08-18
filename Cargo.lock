@@ -54,6 +54,7 @@ dependencies = [
  "diff-core",
  "serde",
  "serde_json",
+ "session",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
