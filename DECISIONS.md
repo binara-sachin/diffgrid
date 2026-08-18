@@ -514,3 +514,72 @@ WebKitGTK rendering path (see PLATFORM_NOTES.md's existing "Rendering engine dif
 characterized at all" entry) and may simply not reproduce on the real macOS/WKWebView target, but
 that hasn't been verified either way -- treat any future native tooltip as needing the same
 Xvfb-first check this one got, until macOS says otherwise.
+
+## 2026-08-18 — M4 settings: global-only fields vs. per-tab override, and where each setting's logic lives
+
+**Decision**: `session::Settings` (ignoreWhitespace, ignoreCase, collapseContextLines,
+intraLineMode) persists to `<app-config-dir>/settings.json`, resolved via a Tauri command in the
+`app` crate but with the actual load/save/default logic living in `session` per docs/PLAN.md §5's
+module boundary -- `app`'s own Cargo.toml describes it as "command/event wiring only... the only
+crate allowed to depend on `tauri`", so the path lookup (`app.path().app_config_dir()`, which
+needs a live `AppHandle`) has to stay there, but nothing else does. Only `ignoreWhitespace`/
+`ignoreCase` get a per-tab override (the existing toolbar checkboxes, seeded from `Settings` when
+a tab opens, never written back) -- `collapseContextLines`/`intraLineMode` apply uniformly to
+every tab, matching `docs/UI/ui-01.png`'s toolbar (only whitespace/case appear as quick-toggles)
+and `ui-02.png`'s settings window (collapse-lines and highlight-mode live only there).
+
+**Why**: the mockups themselves draw this exact line, so it's not an arbitrary scope call --
+building per-tab overrides for collapse-lines/highlight-mode would be scope the approved design
+never asked for, and would also require re-mounting or live-reconfiguring already-open CM6
+instances for a capability nothing in the brief requests.
+
+**How it's wired end-to-end (verified under Xvfb, not just unit-tested)**: the settings window
+(a second Tauri window, `docs/UI/ui-02.png`, opened via a gear-icon button and
+`open_settings_window`) persists on every change and emits a `settings-changed` app event; the
+main window listens and updates its already-loaded `settings` state so a currently-open tab's
+*global-only* fields (and the defaults any *new* tab will seed from) stay current without
+polling. Confirmed: toggling a value in the settings window writes the real config-dir JSON file;
+a fresh launch picks up the new defaults; two tabs opened from the same session have fully
+independent `ignoreWhitespace` toggles (toggling one leaves the other's checkbox and diff result
+untouched).
+
+**"Off" is a frontend short-circuit, not a `diff-core`/backend mode** (this was flagged before
+implementation, not discovered after): when `intraLineMode` is `"off"`, `mountFileTab` never
+constructs an `intraLine` options object for `createDiffEditor` at all, so the intra-line
+highlighter extension isn't wired into CM6 and no `intra_line_spans` IPC call happens per visible
+`Replace` line. The Rust command still accepts `IntraLineMode::Off` and returns an empty result if
+somehow called with it (defensive, not the expected path) rather than erroring -- cheap to keep,
+never actually exercised by the frontend.
+
+## 2026-08-18 — Word-mode intra-line diff: token-level histogram diff, not word-aware prefix/suffix trim
+
+**Decision**: `diff_core::intra_line_spans_word_mode` tokenizes each line into maximal
+word/whitespace/other-character-class runs (UTF-16-unit-based, consistent with the character-mode
+path) and runs `imara_diff`'s histogram algorithm over those tokens -- the same algorithm
+`diff_lines` already uses at line granularity, just re-purposed one level down -- rather than
+extending the existing prefix/suffix-trim approach to work at word boundaries.
+
+**Why**: prefix/suffix trimming fundamentally cannot express "two separate changed words with
+unchanged words between them" as two small spans; it can only ever produce one span running from
+the first difference to the last, which for a line with two separate edits far apart *is* word
+mode's whole reason to exist per M2's original DECISIONS.md deferral ("word-boundary-aware
+diffing, not raw UTF-16-unit trimming... treat it as new work"). `imara_diff`'s token interner
+already supports custom token types; a hand-written `Eq`/`Hash` on the token type is what applies
+ignore-whitespace/ignore-case at comparison time (any whitespace-class token equals any other
+under ignore-whitespace; ASCII case-fold equality under ignore-case) while keeping raw UTF-16
+spans for the final offsets -- consistent with how `common_prefix_len_raw`/`eq_unit` already
+handle those same two options for character mode.
+
+**Verified, not just unit-tested**: mutation-tested the token-range-to-UTF16-offset conversion
+(swapped a `.0`/`.1` field access, confirmed 3 of the new tests fail for the right reason, then
+reverted) and visually confirmed under Xvfb that a line with two separate word changes highlights
+as two disjoint spans per side, not one span covering the whole distance between them -- the exact
+property character mode can't provide, now visibly true in the running app.
+
+**How to apply**: non-ASCII UTF-16 units (accented Latin, CJK, emoji, astral surrogate halves) are
+all classified as "word" characters rather than falling through one-unit-at-a-time -- deliberately
+coarser than true Unicode word-segmentation (UAX #29), chosen so word mode doesn't degenerate to
+character mode for non-Latin text. A consequence worth knowing before "fixing" it: an emoji
+directly adjacent to letters with no separator (e.g. "😀bc") merges into *one* token with them,
+not two -- exercising this required correcting a test whose own expectation didn't match the
+tokenizer's deliberate design, not a bug in the tokenizer itself.

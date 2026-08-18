@@ -184,3 +184,17 @@ WKWebView target at all. **Verify on macOS**: if any future feature wants a nati
 or malformed box, before trusting it there -- this repo currently has zero native tooltips in use
 specifically because of this finding, so there's nothing existing to spot-check, only future
 additions to gate.
+
+**The settings window (a real second Tauri window, opened via `open_settings_window`) was
+verified working end-to-end under Xvfb**, including the one part that looked most likely to be
+platform-fragile: SvelteKit's static-adapter SPA fallback (`ssr = false`, `fallback: "index.html"`)
+correctly serves the `/settings` route when Tauri's webview navigates straight to
+`tauri://localhost/settings` with no prior in-app navigation -- confirmed by screenshot, not
+assumed from reading the adapter's docs. Also confirmed: the settings window is a genuine
+separate OS-level window (own title bar, own `xdotool` window ID, `set_focus()` on a second
+`open_settings_window` call rather than a duplicate window), and the `settings-changed` app event
+correctly reaches the main window's listener. None of this exercises anything WebKitGTK-specific
+by construction (window creation and app-wide events are core Tauri, not a rendering concern), but
+per this document's own standing caveat about everything only having run under WebKitGTK/Xvfb so
+far, a real macOS spot-check (open Settings, toggle a value, confirm the main window's next-opened
+tab picks it up) is still worth doing before fully trusting it there.

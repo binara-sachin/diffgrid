@@ -226,6 +226,12 @@ describe("buildCollapseRanges", () => {
     // doc only has 5 real lines even though the hunk metadata claims bigLen -- defensive
     expect(buildCollapseRanges(doc(5), hunks, "left")).toEqual([]);
   });
+
+  it("honors an explicit contextLines argument instead of the COLLAPSE_CONTEXT_LINES default", () => {
+    const hunks: Hunk[] = [{ kind: "equal", left: { start: 0, len: bigLen }, right: { start: 0, len: bigLen } }];
+    const ranges = buildCollapseRanges(doc(bigLen), hunks, "left", 5);
+    expect(ranges).toEqual([{ fromLine: 6, toLine: bigLen - 5 }]);
+  });
 });
 
 describe("updateHunks", () => {

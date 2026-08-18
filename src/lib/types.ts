@@ -65,3 +65,12 @@ export interface ScanOutcome {
   rightVisited: number;
   entriesEmitted: number;
 }
+
+export type IntraLineMode = "off" | "word" | "character";
+
+export interface Settings {
+  ignoreWhitespace: boolean;
+  ignoreCase: boolean;
+  collapseContextLines: number;
+  intraLineMode: IntraLineMode;
+}
