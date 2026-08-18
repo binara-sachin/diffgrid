@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildDirTree, flattenDirTree, pruneDirTree, visibleDirTreeRows } from "./dirView";
+import { buildDirTree, countDirTreeFiles, flattenDirTree, pruneDirTree, visibleDirTreeRows } from "./dirView";
 import type { DirEntry } from "./types";
 
 function entry(path: string, status: DirEntry["status"] = "same", isDir = false): DirEntry {
@@ -95,5 +95,23 @@ describe("visibleDirTreeRows", () => {
     const entries = [entry("src", "same", true), entry("src/unchanged.ts", "same"), entry("src/changed.ts", "modified")];
     const rows = visibleDirTreeRows(entries, true, new Set());
     expect(rows.map((r) => r.path)).toEqual(["src", "src/changed.ts"]);
+  });
+});
+
+describe("countDirTreeFiles", () => {
+  it("counts only files, not folders, at any depth", () => {
+    const entries = [entry("a.txt", "modified"), entry("dir", "same", true), entry("dir/b.txt", "modified"), entry("dir/sub", "same", true), entry("dir/sub/c.txt", "modified")];
+    expect(countDirTreeFiles(buildDirTree(entries))).toBe(3);
+  });
+
+  it("stays accurate regardless of collapse state -- unaffected by flattenDirTree's collapsedPaths", () => {
+    // The regression this guards: the sidebar's "CHANGED FILES · N" header must count every
+    // changed file even when its parent folder is currently collapsed, not just the rows
+    // flattenDirTree happens to currently emit.
+    const entries = [entry("dir", "same", true), entry("dir/a.txt", "modified"), entry("dir/b.txt", "modified")];
+    const tree = pruneDirTree(buildDirTree(entries), true);
+    const collapsedCount = flattenDirTree(tree, new Set(["dir"])).filter((r) => !r.isDir).length;
+    expect(collapsedCount).toBe(0); // rows are hidden while collapsed...
+    expect(countDirTreeFiles(tree)).toBe(2); // ...but the true count doesn't change.
   });
 });
