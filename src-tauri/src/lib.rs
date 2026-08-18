@@ -176,9 +176,22 @@ fn apply_edit(state: tauri::State<SessionState>, side: Side, from_utf16: u32, to
     apply_edit_impl(&state, side, from_utf16, to_utf16, &inserted)
 }
 
+/// Holds *both* locks for the whole read, not one at a time: `state.left.lock().unwrap().as_ref()
+/// ...text()` as a single expression would drop the left guard before acquiring the right one,
+/// leaving a real gap where a concurrent `apply_edit` on either side (Tauri commands aren't
+/// guaranteed to run serialized) could land -- diffing a left snapshot from time T against a
+/// right snapshot from time T+1. That produces a `FileDiffResult` whose `LineRange`s don't
+/// correspond to either pane's actual current content, which then feeds straight into
+/// `buildCollapseRanges`/`spansToMarkRanges` on the frontend -- the same "hunk metadata silently
+/// stops matching the text it claims to describe" failure class as the earlier UTF-16 and serde
+/// bugs, just from a torn read instead of a wire-format mismatch. Always lock left before right
+/// here (and nowhere else in this file locks both at once) so this can't deadlock against another
+/// caller locking in the opposite order.
 fn redo_diff_impl(state: &SessionState, ignore_whitespace: bool, ignore_case: bool) -> Result<diff_core::FileDiffResult, String> {
-    let left = state.left.lock().unwrap().as_ref().ok_or("no file open on the left")?.text();
-    let right = state.right.lock().unwrap().as_ref().ok_or("no file open on the right")?.text();
+    let left_guard = state.left.lock().unwrap();
+    let right_guard = state.right.lock().unwrap();
+    let left = left_guard.as_ref().ok_or("no file open on the left")?.text();
+    let right = right_guard.as_ref().ok_or("no file open on the right")?.text();
     Ok(diff_core::diff_lines_with_options(&left, &right, diff_core::DiffOptions { ignore_whitespace, ignore_case }))
 }
 
