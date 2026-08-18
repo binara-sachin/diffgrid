@@ -38,6 +38,13 @@
   let ignoreCase = $state(false);
   let dirtyLeft = $state(false);
   let dirtyRight = $state(false);
+  let savingLeft = $state(false);
+  let savingRight = $state(false);
+  // The paths runRealFiles opened -- save_file needs these to know where to write back to,
+  // since EditBuffer only holds the bytes/text, not the path it came from (that's the
+  // frontend's concern, same as it already is for open_file_pair/open_file_text).
+  let leftPath = "";
+  let rightPath = "";
 
   // Populated by runRealFiles; read by retoggleDiffOptions and hunk navigation. leftView/
   // rightView aren't read in the template, so plain variables suffice; changeLines and
@@ -140,6 +147,34 @@
     scheduleDebouncedRedoDiff();
   }
 
+  /**
+   * Flushes that side's pending edit queue first (so a save can never race an `apply_edit`
+   * still in flight for the same side and write a half-updated buffer), then asks Rust to write
+   * `EditBuffer::to_bytes()` back to the original path -- encoding/line-ending-preserving per
+   * docs/PLAN.md §2. Errors (e.g. a Latin-1 buffer containing a character that encoding can't
+   * represent, see `text_io::to_bytes`) are surfaced via `status` rather than silently dropped,
+   * since a failed save leaving `dirty*` set is exactly the correct outcome -- the file on disk
+   * genuinely doesn't match the buffer yet.
+   */
+  async function saveSide(side: "left" | "right") {
+    const path = side === "left" ? leftPath : rightPath;
+    if (!path) return;
+    if (side === "left") savingLeft = true;
+    else savingRight = true;
+    try {
+      await (side === "left" ? editQueueLeft : editQueueRight);
+      await invoke("save_file", { side, path });
+      if (side === "left") dirtyLeft = false;
+      else dirtyRight = false;
+    } catch (err) {
+      status = `save failed (${side}): ${err}`;
+      await invoke("report_error", { message: `save_file(${side}): ${err}` });
+    } finally {
+      if (side === "left") savingLeft = false;
+      else savingRight = false;
+    }
+  }
+
   function goToHunk(direction: 1 | -1) {
     if (!leftView || changeLines.length === 0) return;
     currentHunk = direction === 1 ? nextHunkIndex(changeLines.length, currentHunk) : prevHunkIndex(changeLines.length, currentHunk);
@@ -158,13 +193,22 @@
       invoke("report_error", { message: `unhandledrejection: ${String(e.reason)}` });
     });
     window.addEventListener("keydown", (e) => {
-      if (!e.altKey || !isRealFileMode) return;
-      if (e.key === "ArrowDown") {
+      if (!isRealFileMode) return;
+      if (e.altKey) {
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          goToHunk(1);
+        } else if (e.key === "ArrowUp") {
+          e.preventDefault();
+          goToHunk(-1);
+        }
+        return;
+      }
+      // Cmd+S on macOS, Ctrl+S elsewhere -- saves whichever pane currently has focus.
+      if ((e.metaKey || e.ctrlKey) && e.key === "s") {
         e.preventDefault();
-        goToHunk(1);
-      } else if (e.key === "ArrowUp") {
-        e.preventDefault();
-        goToHunk(-1);
+        if (leftView?.hasFocus) saveSide("left");
+        else if (rightView?.hasFocus) saveSide("right");
       }
     });
     try {
@@ -188,6 +232,8 @@
    * editable, edits forwarded to Rust's `EditBuffer`s, debounced re-diff.
    */
   async function runRealFiles(left: string, right: string) {
+    leftPath = left;
+    rightPath = right;
     status = "diffing…";
     const [result, leftBuf, rightBuf] = await Promise.all([
       invoke<OpenPairResult>("open_file_pair", { left, right }),
@@ -301,6 +347,12 @@
         <input type="checkbox" bind:checked={ignoreCase} onchange={retoggleDiffOptions} />
         Ignore case
       </label>
+      <button onclick={() => saveSide("left")} disabled={!dirtyLeft || savingLeft} title="Save left (Cmd/Ctrl+S while focused)">
+        {dirtyLeft ? "● " : ""}Save left
+      </button>
+      <button onclick={() => saveSide("right")} disabled={!dirtyRight || savingRight} title="Save right (Cmd/Ctrl+S while focused)">
+        {dirtyRight ? "● " : ""}Save right
+      </button>
     </div>
   {/if}
   <div class="panes">
