@@ -152,9 +152,135 @@ pub fn load(bytes: &[u8]) -> LoadedText {
     }
 }
 
+/// Encodes `text` (LF-only, as held in an edited buffer) back to bytes matching `meta`'s
+/// encoding and line-ending style, for M2's save path. This is only the *edited*-buffer half of
+/// saving: an unedited buffer must write back the exact original bytes captured at open time
+/// (byte-identical, including any BOM and the file's original mixed-line-ending pattern) rather
+/// than going through this function at all — round-tripping through `load()`'s normalization
+/// and then re-deriving bytes here would lose information `load()` already discarded (which
+/// exact newlines were CRLF and which were LF in a `Mixed` file; whether a UTF-8 BOM was
+/// present). That decision belongs to the caller (`session::EditBuffer`, which holds the
+/// original bytes and a dirty flag); this function only handles the case where the buffer's
+/// content has actually changed and a real re-encode is unavoidable.
+///
+/// `LineEnding::Mixed` has no way to be preserved once the content has changed -- the per-line
+/// origin of each newline was already discarded at load time, and there is no principled way to
+/// decide which (possibly new) lines should get CRLF vs LF. Normalizes to LF uniformly on save,
+/// same as `LineEnding::Lf`. This is a deliberate, documented behavior change (see
+/// DECISIONS.md), not a silent one -- it only ever applies to files that were already
+/// mixed-line-ending *and* have been edited.
+///
+/// Returns an error rather than lossily substituting a placeholder character if `text` contains
+/// a character that cannot be represented in `meta.encoding` (only possible for `Latin1`, where
+/// any character above U+00FF has no encoding) -- silently replacing what the user typed with
+/// `?` on save would be data loss.
+pub fn to_bytes(text: &str, meta: &FileMeta) -> Result<Vec<u8>, String> {
+    let line_converted: std::borrow::Cow<str> = match meta.line_ending {
+        LineEnding::Lf | LineEnding::Mixed => text.into(),
+        LineEnding::Crlf => text.replace('\n', "\r\n").into(),
+    };
+
+    match meta.encoding {
+        Encoding::Utf8 => Ok(line_converted.into_owned().into_bytes()),
+        Encoding::Utf16Le => Ok(encode_utf16_bom(&line_converted, u16::to_le_bytes, [0xFF, 0xFE])),
+        Encoding::Utf16Be => Ok(encode_utf16_bom(&line_converted, u16::to_be_bytes, [0xFE, 0xFF])),
+        Encoding::Latin1 => {
+            let mut bytes = Vec::with_capacity(line_converted.len());
+            for c in line_converted.chars() {
+                let cp = c as u32;
+                if cp > 0xFF {
+                    return Err(format!(
+                        "character {c:?} (U+{cp:04X}) cannot be represented in Latin-1 -- save refused rather than substituting a placeholder"
+                    ));
+                }
+                bytes.push(cp as u8);
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+fn encode_utf16_bom(text: &str, to_bytes: fn(u16) -> [u8; 2], bom: [u8; 2]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(bom.len() + text.len() * 2);
+    bytes.extend_from_slice(&bom);
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&to_bytes(unit));
+    }
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn meta(encoding: Encoding, line_ending: LineEnding) -> FileMeta {
+        FileMeta { encoding, line_ending, trailing_newline: true, is_binary: false, line_count: 0 }
+    }
+
+    #[test]
+    fn to_bytes_lf_utf8_is_unchanged() {
+        let bytes = to_bytes("a\nb\nc\n", &meta(Encoding::Utf8, LineEnding::Lf)).unwrap();
+        assert_eq!(bytes, b"a\nb\nc\n");
+    }
+
+    #[test]
+    fn to_bytes_converts_lf_to_crlf_for_crlf_line_ending() {
+        let bytes = to_bytes("a\nb\nc\n", &meta(Encoding::Utf8, LineEnding::Crlf)).unwrap();
+        assert_eq!(bytes, b"a\r\nb\r\nc\r\n");
+    }
+
+    /// Documented, deliberate behavior (see DECISIONS.md): a `Mixed`-line-ending file that has
+    /// been edited can't have its exact original per-line CRLF/LF pattern reconstructed (that
+    /// information was already discarded by `normalize_line_endings` at load time), so an
+    /// edited Mixed buffer saves as uniform LF rather than guessing.
+    #[test]
+    fn to_bytes_mixed_line_ending_normalizes_to_lf_when_edited() {
+        let bytes = to_bytes("a\nb\nc\n", &meta(Encoding::Utf8, LineEnding::Mixed)).unwrap();
+        assert_eq!(bytes, b"a\nb\nc\n");
+    }
+
+    #[test]
+    fn to_bytes_encodes_utf16le_with_bom() {
+        let bytes = to_bytes("hi\n", &meta(Encoding::Utf16Le, LineEnding::Lf)).unwrap();
+        let mut expected = vec![0xFF, 0xFE];
+        for u in "hi\n".encode_utf16() {
+            expected.extend_from_slice(&u.to_le_bytes());
+        }
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn to_bytes_encodes_utf16be_with_bom() {
+        let bytes = to_bytes("hi\n", &meta(Encoding::Utf16Be, LineEnding::Lf)).unwrap();
+        let mut expected = vec![0xFE, 0xFF];
+        for u in "hi\n".encode_utf16() {
+            expected.extend_from_slice(&u.to_be_bytes());
+        }
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn to_bytes_utf16_round_trips_through_decode() {
+        // encode -> decode must recover the exact text, for both byte orders, including an
+        // astral character that needs a surrogate pair.
+        let text = "a\nb😀\nc\n";
+        for enc in [Encoding::Utf16Le, Encoding::Utf16Be] {
+            let bytes = to_bytes(text, &meta(enc, LineEnding::Lf)).unwrap();
+            assert_eq!(decode(&bytes, enc), text);
+        }
+    }
+
+    #[test]
+    fn to_bytes_encodes_latin1_ascii_and_high_bytes() {
+        let bytes = to_bytes("a\u{80}b\n", &meta(Encoding::Latin1, LineEnding::Lf)).unwrap();
+        assert_eq!(bytes, &[b'a', 0x80, b'b', b'\n']);
+    }
+
+    #[test]
+    fn to_bytes_rejects_a_char_the_target_encoding_cannot_represent_rather_than_substituting() {
+        let result = to_bytes("hello 😀\n", &meta(Encoding::Latin1, LineEnding::Lf));
+        assert!(result.is_err(), "an astral emoji has no Latin-1 representation and must be refused, not replaced");
+    }
 
     #[test]
     fn empty_bytes_is_not_binary() {
