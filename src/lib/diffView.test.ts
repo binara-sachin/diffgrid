@@ -14,6 +14,9 @@ import {
   changeHunkLines,
   nextHunkIndex,
   prevHunkIndex,
+  computeMinimapSegments,
+  computeViewportIndicator,
+  minimapClickToLine,
 } from "./diffView";
 import type { Hunk, Span } from "./types";
 
@@ -306,5 +309,68 @@ describe("nextHunkIndex / prevHunkIndex", () => {
   it("returns -1 for both directions when there are no hunks to navigate", () => {
     expect(nextHunkIndex(0, -1)).toBe(-1);
     expect(prevHunkIndex(0, -1)).toBe(-1);
+  });
+});
+
+describe("computeMinimapSegments", () => {
+  it("positions a segment at the hunk's fractional offset and length along the left axis", () => {
+    const hunks: Hunk[] = [{ kind: "replace", left: { start: 10, len: 5 }, right: { start: 10, len: 5 } }];
+    const segments = computeMinimapSegments(hunks, 100);
+    expect(segments).toEqual([{ kind: "replace", startFrac: 0.1, lenFrac: 0.05 }]);
+  });
+
+  it("never emits a segment for an equal hunk", () => {
+    const hunks: Hunk[] = [{ kind: "equal", left: { start: 0, len: 100 }, right: { start: 0, len: 100 } }];
+    expect(computeMinimapSegments(hunks, 100)).toEqual([]);
+  });
+
+  it("gives a pure insert a true zero length on the left axis, not an inflated fraction", () => {
+    // Visibility for near-zero segments is the rendering layer's job (a fixed-pixel
+    // min-height in CSS), not this function's -- see the doc comment on why a fractional
+    // floor here would distort real hunk sizes on a large document.
+    const hunks: Hunk[] = [{ kind: "insert", left: { start: 50, len: 0 }, right: { start: 50, len: 3 } }];
+    const segments = computeMinimapSegments(hunks, 100);
+    expect(segments).toEqual([{ kind: "insert", startFrac: 0.5, lenFrac: 0 }]);
+  });
+
+  it("does not inflate a small real hunk's length on a large document", () => {
+    const hunks: Hunk[] = [{ kind: "replace", left: { start: 50000, len: 10 }, right: { start: 50000, len: 10 } }];
+    const segments = computeMinimapSegments(hunks, 100_000);
+    expect(segments[0].lenFrac).toBeCloseTo(0.0001, 6);
+  });
+
+  it("returns nothing for an empty document", () => {
+    expect(computeMinimapSegments([{ kind: "replace", left: { start: 0, len: 1 }, right: { start: 0, len: 1 } }], 0)).toEqual([]);
+  });
+});
+
+describe("computeViewportIndicator", () => {
+  it("computes the visible fraction and top offset from real scroll geometry", () => {
+    // 1000px of scrollable content, viewport shows 100px starting 200px down
+    expect(computeViewportIndicator(200, 1000, 100)).toEqual({ topFrac: 0.2, heightFrac: 0.1 });
+  });
+
+  it("clamps height fraction to 1 when the whole document already fits in the viewport", () => {
+    expect(computeViewportIndicator(0, 100, 400)).toEqual({ topFrac: 0, heightFrac: 1 });
+  });
+
+  it("is well-defined when there is nothing to scroll (content shorter than the viewport)", () => {
+    expect(computeViewportIndicator(0, 0, 400)).toEqual({ topFrac: 0, heightFrac: 1 });
+  });
+});
+
+describe("minimapClickToLine", () => {
+  it("maps a fractional click position to a 1-indexed line number", () => {
+    expect(minimapClickToLine(0.5, 100)).toBe(51);
+  });
+
+  it("clamps to the first line for a click at or above the top", () => {
+    expect(minimapClickToLine(0, 100)).toBe(1);
+    expect(minimapClickToLine(-0.1, 100)).toBe(1);
+  });
+
+  it("clamps to the last line for a click at or below the bottom", () => {
+    expect(minimapClickToLine(1, 100)).toBe(100);
+    expect(minimapClickToLine(1.1, 100)).toBe(100);
   });
 });

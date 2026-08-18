@@ -12,7 +12,12 @@
     nextHunkIndex,
     prevHunkIndex,
     scrollToLine,
+    computeMinimapSegments,
+    computeViewportIndicator,
+    minimapClickToLine,
     type ChangeHunkLine,
+    type MinimapSegment,
+    type ViewportIndicator,
   } from "$lib/diffView";
   import type { FileDiffResult, OpenPairResult, Span } from "$lib/types";
 
@@ -35,6 +40,9 @@
   let rightText = "";
   let changeLines: ChangeHunkLine[] = $state([]);
   let currentHunk = $state(-1);
+  let minimapSegments: MinimapSegment[] = $state([]);
+  let viewportIndicator: ViewportIndicator = $state({ topFrac: 0, heightFrac: 1 });
+  let totalLines = 0;
 
   function applyNewHunks(hunks: FileDiffResult["hunks"]) {
     if (!leftView || !rightView) return;
@@ -42,6 +50,19 @@
     updateHunks(rightView, hunks);
     changeLines = changeHunkLines(hunks);
     currentHunk = -1;
+    minimapSegments = computeMinimapSegments(hunks, totalLines);
+  }
+
+  function updateViewportIndicator() {
+    if (!leftView) return;
+    const { scrollTop, scrollHeight, clientHeight } = leftView.scrollDOM;
+    viewportIndicator = computeViewportIndicator(scrollTop, scrollHeight, clientHeight);
+  }
+
+  function onMinimapClick(e: MouseEvent) {
+    if (!leftView || totalLines === 0) return;
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    scrollToLine(leftView, minimapClickToLine((e.clientY - rect.top) / rect.height, totalLines));
   }
 
   async function retoggleDiffOptions() {
@@ -144,8 +165,12 @@
     );
     syncScroll(leftView, rightView);
     isRealFileMode = true;
+    totalLines = leftDoc.lines;
     changeLines = changeHunkLines(result.diff.hunks);
     currentHunk = -1;
+    minimapSegments = computeMinimapSegments(result.diff.hunks, totalLines);
+    leftView.scrollDOM.addEventListener("scroll", updateViewportIndicator);
+    updateViewportIndicator();
 
     statLine = `+${result.diff.stats.added} -${result.diff.stats.removed} ${result.diff.stats.chunks} chunks`;
     status = "ready";
@@ -210,6 +235,21 @@
   <div class="panes">
     <div id="left-pane" class="pane"></div>
     <div id="right-pane" class="pane"></div>
+    {#if isRealFileMode}
+      <!-- Supplementary pointing-device shortcut to the same navigation the Prev/Next diff
+           buttons and Alt+Up/Down already provide with full keyboard access. A click here
+           means "jump to the line at this Y position," which has no meaningful keyboard
+           equivalent (unlike a real interactive control) -- deliberately not keyboard-operable
+           itself, since the same destinations are already reachable by keyboard elsewhere. -->
+      <!-- svelte-ignore a11y_click_events_have_key_events -->
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div class="minimap" onclick={onMinimapClick} title="Click to jump to a position in the file">
+        {#each minimapSegments as seg}
+          <div class="minimap-segment minimap-{seg.kind}" style="top: {seg.startFrac * 100}%; height: {seg.lenFrac * 100}%;"></div>
+        {/each}
+        <div class="minimap-viewport" style="top: {viewportIndicator.topFrac * 100}%; height: {viewportIndicator.heightFrac * 100}%;"></div>
+      </div>
+    {/if}
   </div>
 </main>
 
@@ -268,6 +308,38 @@
     flex: 1 1 auto;
     display: flex;
     min-height: 0;
+  }
+  .minimap {
+    flex: 0 0 14px;
+    position: relative;
+    background: #1a1a1a;
+    cursor: pointer;
+  }
+  .minimap-segment {
+    position: absolute;
+    left: 3px;
+    right: 3px;
+    border-radius: 1px;
+    min-height: 2px;
+    pointer-events: none;
+  }
+  .minimap-insert {
+    background: #3fb950;
+  }
+  .minimap-delete {
+    background: #f85149;
+  }
+  .minimap-replace {
+    background: #d29922;
+  }
+  .minimap-viewport {
+    position: absolute;
+    left: 0;
+    right: 0;
+    border: 1px solid #7aa2f7;
+    border-radius: 2px;
+    box-sizing: border-box;
+    pointer-events: none;
   }
   .pane {
     flex: 1 1 50%;

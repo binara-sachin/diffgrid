@@ -386,6 +386,54 @@ export function scrollToLine(view: EditorView, lineNo: number): void {
   view.dispatch({ effects: EditorView.scrollIntoView(pos, { y: "center" }) });
 }
 
+export interface MinimapSegment {
+  kind: "insert" | "delete" | "replace";
+  startFrac: number;
+  lenFrac: number;
+}
+
+/**
+ * Fractional (0-1) positions for a single shared overview strip, per the approved UI model
+ * (docs/UI/ui-01.png) — one strip for the whole diff, not one per pane. Positioned along the
+ * *left* side's line numbers: a pure Insert hunk has `left.len === 0`, so its fraction is 0 —
+ * deliberately a true proportional value, not inflated to an arbitrary minimum here. A fixed
+ * *fraction* minimum (e.g. 1% of the document) looks fine on a short file but, on a 100k-line
+ * file, 1% is 1000 lines — enough to make every real hunk's true size disappear under an
+ * oversized block and merge adjacent hunks into a solid bar (caught by actually rendering this
+ * against the 100k fixture, not just testing the math in isolation). Making near-zero segments
+ * visible is instead the rendering layer's job (`.minimap-segment { min-height: 2px }` in
+ * +page.svelte) — a fixed pixel floor scales correctly at any document size, since it doesn't
+ * depend on total line count at all.
+ */
+export function computeMinimapSegments(hunks: Hunk[], totalLines: number): MinimapSegment[] {
+  if (totalLines <= 0) return [];
+  const segments: MinimapSegment[] = [];
+  for (const h of hunks) {
+    if (h.kind === "equal") continue;
+    segments.push({ kind: h.kind, startFrac: h.left.start / totalLines, lenFrac: h.left.len / totalLines });
+  }
+  return segments;
+}
+
+export interface ViewportIndicator {
+  topFrac: number;
+  heightFrac: number;
+}
+
+/** Well-defined (not NaN/Infinity) when there's nothing to scroll, so the minimap can always
+ * render a viewport rectangle without a special-case check at the call site. */
+export function computeViewportIndicator(scrollTop: number, scrollHeight: number, clientHeight: number): ViewportIndicator {
+  if (scrollHeight <= 0) return { topFrac: 0, heightFrac: 1 };
+  return { topFrac: scrollTop / scrollHeight, heightFrac: Math.min(1, clientHeight / scrollHeight) };
+}
+
+/** Inverse of the positioning `computeMinimapSegments` uses: a click at fractional position
+ * `clickFrac` down the strip jumps to this 1-indexed line, clamped to the document's bounds. */
+export function minimapClickToLine(clickFrac: number, totalLines: number): number {
+  const line = Math.round(clickFrac * totalLines) + 1;
+  return Math.max(1, Math.min(totalLines, line));
+}
+
 export function createDiffEditor(
   parent: HTMLElement,
   text: string,
