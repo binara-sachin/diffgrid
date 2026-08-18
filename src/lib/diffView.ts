@@ -191,18 +191,25 @@ const setIntraLineDecorations = StateEffect.define<DecorationSet>();
  * rather than one shared builder pass, since padding/collapse are conceptually separate steps
  * (and collapse is optional) — merging is O(n) and CM6-provided, not worth folding into one loop.
  */
-function computeMainDecorations(doc: Text, hunks: Hunk[], side: "left" | "right", disablePadding: boolean, collapseEqual: boolean): DecorationSet {
+function computeMainDecorations(
+  doc: Text,
+  hunks: Hunk[],
+  side: "left" | "right",
+  disablePadding: boolean,
+  collapseEqual: boolean,
+  collapseContextLines: number,
+): DecorationSet {
   const main = buildDecorations(doc, hunks, side, disablePadding);
-  const collapse = collapseEqual ? buildCollapseDecorations(doc, hunks, side) : Decoration.none;
+  const collapse = collapseEqual ? buildCollapseDecorations(doc, hunks, side, collapseContextLines) : Decoration.none;
   return RangeSet.join([main, collapse]);
 }
 
-function mainDecorationsField(side: "left" | "right", disablePadding: boolean, collapseEqual: boolean) {
+function mainDecorationsField(side: "left" | "right", disablePadding: boolean, collapseEqual: boolean, collapseContextLines: number) {
   return StateField.define<DecorationSet>({
     create: () => Decoration.none, // overridden per-instance via `.init(...)` in createDiffEditor
     update(value, tr) {
       for (const effect of tr.effects) {
-        if (effect.is(setHunks)) value = computeMainDecorations(tr.state.doc, effect.value, side, disablePadding, collapseEqual);
+        if (effect.is(setHunks)) value = computeMainDecorations(tr.state.doc, effect.value, side, disablePadding, collapseEqual, collapseContextLines);
       }
       return value;
     },
@@ -355,14 +362,19 @@ export interface CollapseRange {
  * attribute, since padding is only ever anchored at a hunk boundary (the first line of the
  * following hunk, or the document's last line), never inside the middle of a run.
  */
-export function buildCollapseRanges(doc: Text, hunks: Hunk[], side: "left" | "right"): CollapseRange[] {
+export function buildCollapseRanges(
+  doc: Text,
+  hunks: Hunk[],
+  side: "left" | "right",
+  contextLines: number = COLLAPSE_CONTEXT_LINES,
+): CollapseRange[] {
   const ranges: CollapseRange[] = [];
   for (const h of hunks) {
     if (h.kind !== "equal") continue;
     const range = side === "left" ? h.left : h.right;
     if (range.len <= COLLAPSE_MIN_HUNK_LINES) continue;
-    const fromLine = range.start + COLLAPSE_CONTEXT_LINES + 1;
-    const toLine = range.start + range.len - COLLAPSE_CONTEXT_LINES;
+    const fromLine = range.start + contextLines + 1;
+    const toLine = range.start + range.len - contextLines;
     if (toLine < fromLine || toLine > doc.lines) continue;
     ranges.push({ fromLine, toLine });
   }
@@ -401,9 +413,14 @@ export class CollapseWidget extends WidgetType {
  * Not yet interactive — there is no click-to-expand. See DECISIONS.md for why that's deferred
  * rather than silently missing.
  */
-export function buildCollapseDecorations(doc: Text, hunks: Hunk[], side: "left" | "right"): DecorationSet {
+export function buildCollapseDecorations(
+  doc: Text,
+  hunks: Hunk[],
+  side: "left" | "right",
+  contextLines: number = COLLAPSE_CONTEXT_LINES,
+): DecorationSet {
   const builder = new RangeSetBuilder<Decoration>();
-  for (const { fromLine, toLine } of buildCollapseRanges(doc, hunks, side)) {
+  for (const { fromLine, toLine } of buildCollapseRanges(doc, hunks, side, contextLines)) {
     const from = doc.line(fromLine).from;
     const to = doc.line(toLine).to;
     builder.add(from, to, Decoration.replace({ block: true, widget: new CollapseWidget(toLine - fromLine + 1) }));
@@ -542,9 +559,10 @@ export function createDiffEditor(
   collapseEqual = false,
   editable = false,
   onEdit?: (deltas: EditDelta[]) => void,
+  collapseContextLines: number = COLLAPSE_CONTEXT_LINES,
 ): EditorView {
   const doc = Text.of(text.split("\n"));
-  const field = mainDecorationsField(side, disablePadding, collapseEqual);
+  const field = mainDecorationsField(side, disablePadding, collapseEqual, collapseContextLines);
 
   const state = EditorState.create({
     doc,
@@ -553,7 +571,7 @@ export function createDiffEditor(
       keymap.of(defaultKeymap),
       javascript(),
       EditorState.readOnly.of(!editable),
-      field.init(() => computeMainDecorations(doc, hunks, side, disablePadding, collapseEqual)),
+      field.init(() => computeMainDecorations(doc, hunks, side, disablePadding, collapseEqual, collapseContextLines)),
       ...(intraLine
         ? intraLineHighlighter(hunks, side, intraLine.getOtherDoc, intraLine.fetchSpans, intraLine.onFetchError)
         : []),

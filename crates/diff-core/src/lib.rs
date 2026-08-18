@@ -98,6 +98,18 @@ fn is_ascii_ws_unit(u: u16) -> bool {
     matches!(u, 0x20 | 0x09 | 0x0a | 0x0d | 0x0c | 0x0b)
 }
 
+// ASCII-only case fold at the UTF-16-unit level -- matches the overwhelming majority of real
+// source code. Unlike `normalize_line`'s full Unicode `to_lowercase()`, folding per-unit while
+// preserving raw offsets can't use a full Unicode case fold (that can change the number of
+// units), so this is a deliberately narrower approximation for this path only.
+fn fold_unit_for_case(u: u16) -> u16 {
+    if (b'A' as u16..=b'Z' as u16).contains(&u) {
+        u + 32
+    } else {
+        u
+    }
+}
+
 fn eq_unit(a: u16, b: u16, ignore_case: bool) -> bool {
     if a == b {
         return true;
@@ -105,12 +117,7 @@ fn eq_unit(a: u16, b: u16, ignore_case: bool) -> bool {
     if !ignore_case {
         return false;
     }
-    // ASCII-only case fold at the UTF-16-unit level -- matches the overwhelming majority of
-    // real source code. Unlike `normalize_line`'s full Unicode `to_lowercase()`, folding
-    // per-unit while preserving raw offsets can't use a full Unicode case fold (that can change
-    // the number of units), so this is a deliberately narrower approximation for this path only.
-    let fold = |u: u16| if (b'A' as u16..=b'Z' as u16).contains(&u) { u + 32 } else { u };
-    fold(a) == fold(b)
+    fold_unit_for_case(a) == fold_unit_for_case(b)
 }
 
 /// Common-prefix length in raw UTF-16 units for each side, honoring `opts`. Under
@@ -230,6 +237,131 @@ pub fn intra_line_spans_with_options(left: &str, right: &str, opts: DiffOptions)
     }
     if end_r > prefix_r {
         spans.push(Span { side: Side::Right, start_utf16: prefix_r as u32, len_utf16: (end_r - prefix_r) as u32 });
+    }
+    spans
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum WordUnitClass {
+    Word,
+    Whitespace,
+    Other,
+}
+
+fn classify_word_unit(u: u16) -> WordUnitClass {
+    if is_ascii_ws_unit(u) {
+        WordUnitClass::Whitespace
+    } else if u < 128 {
+        let c = u as u8 as char;
+        if c.is_ascii_alphanumeric() || c == '_' {
+            WordUnitClass::Word
+        } else {
+            WordUnitClass::Other
+        }
+    } else {
+        // Non-ASCII units (accented letters, CJK, astral surrogate halves, emoji) are treated
+        // as word characters rather than falling through to `Other` one unit at a time -- the
+        // ASCII-centric classification above would otherwise make word mode degenerate to
+        // character mode for any non-Latin text, tokenizing every non-ASCII code unit as its own
+        // single-unit "Other" token instead of grouping a whole run of them into one word.
+        WordUnitClass::Word
+    }
+}
+
+/// Splits a UTF-16 unit slice into maximal runs of the same `WordUnitClass`, returned as
+/// `(start, end)` unit-index ranges (end exclusive, never empty). This is the token granularity
+/// word mode diffs at.
+fn tokenize_word_units(units: &[u16]) -> Vec<(usize, usize)> {
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < units.len() {
+        let class = classify_word_unit(units[i]);
+        let start = i;
+        i += 1;
+        while i < units.len() && classify_word_unit(units[i]) == class {
+            i += 1;
+        }
+        tokens.push((start, i));
+    }
+    tokens
+}
+
+/// One word/whitespace/other-run token, borrowing its raw UTF-16 units so spans can be
+/// reconstructed from token-index ranges after the diff, plus the `DiffOptions` that govern how
+/// two tokens compare -- `Eq`/`Hash` below are what `imara_diff`'s interner actually uses to
+/// decide token identity, so they (not a separate comparison pass) are where ignore-whitespace/
+/// ignore-case are applied. `Eq` and `Hash` are hand-written rather than derived specifically so
+/// they can stay consistent with each other under those options (derived `Hash`/`Eq` would hash
+/// and compare the raw slice unconditionally, ignoring `opts` entirely).
+#[derive(Clone, Copy)]
+struct WordToken<'a> {
+    class: WordUnitClass,
+    raw: &'a [u16],
+    opts: DiffOptions,
+}
+
+impl PartialEq for WordToken<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.class != other.class {
+            return false;
+        }
+        if self.opts.ignore_whitespace && self.class == WordUnitClass::Whitespace {
+            // Any whitespace run equals any other, regardless of length -- mirrors
+            // `common_prefix_len_raw`'s "amount doesn't matter, presence does" rule, which this
+            // class check already enforces (a Whitespace token can never equal a Word/Other one).
+            return true;
+        }
+        if self.raw.len() != other.raw.len() {
+            return false;
+        }
+        self.raw.iter().zip(other.raw.iter()).all(|(&a, &b)| eq_unit(a, b, self.opts.ignore_case))
+    }
+}
+
+impl Eq for WordToken<'_> {}
+
+impl std::hash::Hash for WordToken<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.class.hash(state);
+        if self.opts.ignore_whitespace && self.class == WordUnitClass::Whitespace {
+            return; // must match `eq`'s "any whitespace run is interchangeable" rule
+        }
+        for &u in self.raw {
+            (if self.opts.ignore_case { fold_unit_for_case(u) } else { u }).hash(state);
+        }
+    }
+}
+
+/// Word-mode intra-line diff (docs/UI/ui-02.png's Off/Word/Character setting; deferred from M2,
+/// see DECISIONS.md): tokenizes each line into maximal word/whitespace/other-run tokens and runs
+/// the same histogram algorithm `diff_lines` uses at the line level, at token granularity
+/// instead. Unlike `intra_line_spans_with_options`'s prefix/suffix trim, this can identify
+/// multiple separate changed words on one line as separate spans rather than one span covering
+/// everything between the first and last difference.
+pub fn intra_line_spans_word_mode(left: &str, right: &str, opts: DiffOptions) -> Vec<Span> {
+    let l: Vec<u16> = left.encode_utf16().collect();
+    let r: Vec<u16> = right.encode_utf16().collect();
+    let l_tokens = tokenize_word_units(&l);
+    let r_tokens = tokenize_word_units(&r);
+
+    let mut input = InternedInput { before: Vec::new(), after: Vec::new(), interner: imara_diff::Interner::new(l_tokens.len() + r_tokens.len()) };
+    input.update_before(l_tokens.iter().map(|&(s, e)| WordToken { class: classify_word_unit(l[s]), raw: &l[s..e], opts }));
+    input.update_after(r_tokens.iter().map(|&(s, e)| WordToken { class: classify_word_unit(r[s]), raw: &r[s..e], opts }));
+
+    let diff = Diff::compute(Algorithm::Histogram, &input);
+
+    let mut spans = Vec::new();
+    for hunk in diff.hunks() {
+        if !hunk.before.is_empty() {
+            let start = l_tokens[hunk.before.start as usize].0;
+            let end = l_tokens[hunk.before.end as usize - 1].1;
+            spans.push(Span { side: Side::Left, start_utf16: start as u32, len_utf16: (end - start) as u32 });
+        }
+        if !hunk.after.is_empty() {
+            let start = r_tokens[hunk.after.start as usize].0;
+            let end = r_tokens[hunk.after.end as usize - 1].1;
+            spans.push(Span { side: Side::Right, start_utf16: start as u32, len_utf16: (end - start) as u32 });
+        }
     }
     spans
 }
@@ -703,5 +835,72 @@ mod tests {
                 Span { side: Side::Right, start_utf16: 0, len_utf16: 7 },
             ]
         );
+    }
+
+    // -- word mode (M4, docs/PLAN.md's Off/Word/Character setting; M2's DECISIONS.md deferred
+    // this exact algorithm, "word-boundary-aware diffing, not raw UTF-16-unit trimming") --
+
+    #[test]
+    fn word_mode_identical_lines_produce_no_spans() {
+        assert_eq!(intra_line_spans_word_mode("foo bar baz", "foo bar baz", DiffOptions::default()), vec![]);
+    }
+
+    #[test]
+    fn word_mode_narrows_to_just_the_changed_word() {
+        let spans = intra_line_spans_word_mode("foo bar baz", "foo XXX baz", DiffOptions::default());
+        assert_eq!(
+            spans,
+            vec![Span { side: Side::Left, start_utf16: 4, len_utf16: 3 }, Span { side: Side::Right, start_utf16: 4, len_utf16: 3 }],
+        );
+    }
+
+    /// The whole point of word mode over character mode's prefix/suffix trim: two changed words
+    /// far apart on the same line produce two small, separate spans per side -- not one giant
+    /// span covering everything between the first and last difference (which is what character
+    /// mode's `intra_line_spans_with_options` would do for this exact input).
+    #[test]
+    fn word_mode_produces_disjoint_spans_for_two_separate_word_changes() {
+        let spans = intra_line_spans_word_mode("foo XXX bar YYY baz", "foo AAA bar BBB baz", DiffOptions::default());
+        let left: Vec<_> = spans.iter().filter(|s| s.side == Side::Left).collect();
+        let right: Vec<_> = spans.iter().filter(|s| s.side == Side::Right).collect();
+        assert_eq!(left.len(), 2, "expected two disjoint left spans (XXX and YYY), got {left:?}");
+        assert_eq!(right.len(), 2, "expected two disjoint right spans (AAA and BBB), got {right:?}");
+        assert_eq!(left[0], &Span { side: Side::Left, start_utf16: 4, len_utf16: 3 });
+        assert_eq!(left[1], &Span { side: Side::Left, start_utf16: 12, len_utf16: 3 });
+    }
+
+    #[test]
+    fn word_mode_ignore_case_treats_same_word_different_case_as_equal() {
+        let opts = DiffOptions { ignore_whitespace: false, ignore_case: true };
+        assert_eq!(intra_line_spans_word_mode("Hello World", "hello world", opts), vec![]);
+    }
+
+    #[test]
+    fn word_mode_ignore_whitespace_treats_differing_amounts_of_space_as_equal() {
+        let opts = DiffOptions { ignore_whitespace: true, ignore_case: false };
+        assert_eq!(intra_line_spans_word_mode("foo   bar", "foo bar", opts), vec![]);
+    }
+
+    #[test]
+    fn word_mode_without_ignore_whitespace_a_whitespace_amount_change_is_a_real_span() {
+        let spans = intra_line_spans_word_mode("foo   bar", "foo bar", DiffOptions::default());
+        assert!(!spans.is_empty(), "differing whitespace amount must count as a real change without the toggle");
+    }
+
+    /// UTF-16 offset correctness across an astral character (2 code units, 1 word token) --
+    /// same class of trap the character-mode tests and `EditBuffer::apply_delta` guard against.
+    #[test]
+    fn word_mode_handles_an_astral_character_inside_a_word_token() {
+        // The emoji sits in its own token (whitespace on both sides), unchanged on both lines --
+        // this tests that an *earlier* token spanning a surrogate pair is measured correctly in
+        // UTF-16 units, so the *later* differing token ("bc" vs "xy") lands at the right offset
+        // rather than one unit short (which is what treating the emoji as 1 unit instead of 2
+        // would produce).
+        let spans = intra_line_spans_word_mode("a 😀 bc d", "a 😀 xy d", DiffOptions::default());
+        let prefix_units = "a 😀 ".encode_utf16().count() as u32;
+        assert_eq!(prefix_units, 5); // 'a', ' ', a surrogate pair, ' '
+        let left = spans.iter().find(|s| s.side == Side::Left).expect("expected a left span");
+        assert_eq!(left.start_utf16, prefix_units, "the changed word token must start right after the emoji token, correctly measured as 2 UTF-16 units");
+        assert_eq!(left.len_utf16, 2, "\"bc\" is 2 UTF-16 units");
     }
 }

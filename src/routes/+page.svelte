@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import { invoke, Channel } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { Text } from "@codemirror/state";
   import type { EditorView } from "@codemirror/view";
   import {
@@ -22,7 +23,7 @@
     type ViewportIndicator,
     type EditDelta,
   } from "$lib/diffView";
-  import type { DiffStats, DirEntry, FileDiffResult, Hunk, OpenPairResult, ScanOutcome, Span } from "$lib/types";
+  import type { DiffStats, DirEntry, FileDiffResult, Hunk, OpenPairResult, ScanOutcome, Settings, Span } from "$lib/types";
   import { visibleDirEntries as visibleDirEntriesFn } from "$lib/dirView";
   import { createTabId, tabLabel } from "$lib/tabs";
 
@@ -40,6 +41,13 @@
   // root pair is a directory comparison) a sidebar of changed files to open tabs from.
   let mode = $state<"loading" | "spike" | "session">("loading");
   let status = $state("loading…");
+
+  // M4's global preferences (docs/PLAN.md §5), loaded once at startup from the Rust-side
+  // persisted file (see load_settings/save_settings in src-tauri). ignoreWhitespace/ignoreCase
+  // here are only ever *defaults* for a newly-opened tab (see newFileTab) -- each tab's own
+  // toolbar checkboxes are the per-tab override PLAN.md describes, and never write back here.
+  // collapseContextLines/intraLineMode have no per-tab override; they apply uniformly.
+  let settings: Settings = $state({ ignoreWhitespace: false, ignoreCase: false, collapseContextLines: 3, intraLineMode: "character" });
 
   // Which kind of root this session was opened on -- determines whether the sidebar shows.
   // `null` until launch args are resolved in onMount.
@@ -128,8 +136,8 @@
       minimapSegments: [],
       viewportIndicator: { topFrac: 0, heightFrac: 1 },
       totalLines: 0,
-      ignoreWhitespace: false,
-      ignoreCase: false,
+      ignoreWhitespace: settings.ignoreWhitespace,
+      ignoreCase: settings.ignoreCase,
       diffStats: null,
     };
   }
@@ -322,8 +330,21 @@
 
     const tab = getTab(id);
     if (!tab) return; // the tab was closed while open_file_pair/open_file_text were in flight
+
+    // "Off" is a frontend short-circuit, not a backend mode: when the setting says not to
+    // highlight intra-line differences at all, `createDiffEditor` never even gets an `intraLine`
+    // option, so the highlighter extension isn't wired in and no `intra_line_spans` IPC round
+    // trip happens per visible Replace line -- not "wired in but always returns empty," which
+    // would still pay that cost for nothing. See DECISIONS.md.
+    const intraLineMode = settings.intraLineMode;
     const fetchSpans = (leftLine: string, rightLine: string) =>
-      invoke<Span[]>("intra_line_spans", { leftLine, rightLine, ignoreWhitespace: tab.ignoreWhitespace, ignoreCase: tab.ignoreCase });
+      invoke<Span[]>("intra_line_spans", {
+        leftLine,
+        rightLine,
+        ignoreWhitespace: tab.ignoreWhitespace,
+        ignoreCase: tab.ignoreCase,
+        mode: intraLineMode,
+      });
     const onFetchError = (message: string) => invoke("report_error", { message: `intra-line(${id}): ${message}` });
 
     status = "mounting editors…";
@@ -337,10 +358,11 @@
       result.diff.hunks,
       "left",
       false,
-      { getOtherDoc: () => (rightView ? rightView.state.doc : rightDocAtOpen), fetchSpans, onFetchError },
+      intraLineMode === "off" ? undefined : { getOtherDoc: () => (rightView ? rightView.state.doc : rightDocAtOpen), fetchSpans, onFetchError },
       true,
       true,
       (deltas) => onEdit(id, "left", deltas),
+      settings.collapseContextLines,
     );
     rightView = createDiffEditor(
       rightEl,
@@ -348,10 +370,11 @@
       result.diff.hunks,
       "right",
       false,
-      { getOtherDoc: () => (leftView ? leftView.state.doc : leftDocAtOpen), fetchSpans, onFetchError },
+      intraLineMode === "off" ? undefined : { getOtherDoc: () => (leftView ? leftView.state.doc : leftDocAtOpen), fetchSpans, onFetchError },
       true,
       true,
       (deltas) => onEdit(id, "right", deltas),
+      settings.collapseContextLines,
     );
     syncScroll(leftView, rightView);
     tabRuntimes.set(id, { leftView, rightView, editQueueLeft: Promise.resolve(), editQueueRight: Promise.resolve(), redoDiffTimer: undefined });
@@ -414,6 +437,12 @@
   }
 
   onMount(async () => {
+    // The settings window emits this after every successful save (src-tauri's save_settings)
+    // so the main window's already-loaded `settings` (and any already-open tab's *global-only*
+    // fields, since those have no per-tab override to protect) stay in sync without polling.
+    listen<Settings>("settings-changed", (event) => {
+      settings = event.payload;
+    });
     window.addEventListener("error", (e) => {
       invoke("report_error", { message: `window.onerror: ${e.message}` });
     });
@@ -442,6 +471,7 @@
       }
     });
     try {
+      settings = await invoke<Settings>("load_settings");
       const args = await invoke<string[]>("launch_args");
       if (args.length === 2) {
         const [leftKind, rightKind] = await Promise.all([
@@ -643,7 +673,10 @@
 </script>
 
 <main>
-  <div class="status">{status}</div>
+  <div class="status">
+    <span class="status-text">{status}</span>
+    <button class="settings-button" onclick={() => invoke("open_settings_window")} title="Settings">⚙</button>
+  </div>
   <div class="body">
     {#if sessionKind === "dir"}
       <aside class="sidebar">
@@ -794,10 +827,24 @@
   }
   .status {
     flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     padding: 4px 8px;
     font-size: 12px;
     background: #222;
     color: #ddd;
+  }
+  .settings-button {
+    background: none;
+    border: none;
+    color: #ddd;
+    font-size: 13px;
+    cursor: pointer;
+    padding: 0 4px;
+  }
+  .settings-button:hover {
+    color: #fff;
   }
   .body {
     flex: 1 1 auto;

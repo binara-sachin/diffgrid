@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use session::EditBuffer;
 use tauri::ipc::{Channel, Response};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 type TabId = String;
 
@@ -169,7 +170,10 @@ fn open_file_text(path: String) -> Result<Response, String> {
 
 /// Viewport-driven per docs/PLAN.md §6: the frontend calls this once per visible `Replace`-hunk
 /// line pair as they scroll into view, not eagerly for the whole file. Thin wrapper — all the
-/// actual logic (and its tests) live in `diff_core::intra_line_spans_with_options`.
+/// actual logic (and its tests) live in `diff_core`. `mode` is `session::IntraLineMode` reused
+/// directly rather than a second parallel enum; `Off` is handled defensively here (an empty
+/// result), but the frontend is expected to never issue this call at all when the setting is
+/// Off -- see DECISIONS.md for why that's a frontend-side short-circuit, not a backend concern.
 ///
 /// Must take the same ignore-whitespace/ignore-case toggles as `diff_texts`: without them, a
 /// line that differs in both whitespace and real content highlights as "the whole line changed"
@@ -181,12 +185,14 @@ fn intra_line_spans(
     right_line: String,
     ignore_whitespace: bool,
     ignore_case: bool,
+    mode: session::IntraLineMode,
 ) -> Vec<diff_core::Span> {
-    diff_core::intra_line_spans_with_options(
-        &left_line,
-        &right_line,
-        diff_core::DiffOptions { ignore_whitespace, ignore_case },
-    )
+    let opts = diff_core::DiffOptions { ignore_whitespace, ignore_case };
+    match mode {
+        session::IntraLineMode::Off => Vec::new(),
+        session::IntraLineMode::Word => diff_core::intra_line_spans_word_mode(&left_line, &right_line, opts),
+        session::IntraLineMode::Character => diff_core::intra_line_spans_with_options(&left_line, &right_line, opts),
+    }
 }
 
 /// Core of `apply_edit`, taking a plain `&SessionState` rather than `tauri::State` so it's
@@ -272,6 +278,57 @@ fn save_file(state: tauri::State<SessionState>, tab_id: String, side: Side, path
 fn path_kind(path: String) -> Result<String, String> {
     let metadata = std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?;
     Ok(if metadata.is_dir() { "dir".to_string() } else { "file".to_string() })
+}
+
+/// M4's global preferences (docs/PLAN.md §5), persisted to `<app-config-dir>/settings.json`.
+/// The actual load/save/default-value logic lives in `session` (the crate PLAN.md's module
+/// boundary assigns "resolved settings" to); this crate's job is only resolving *where* that
+/// file lives on disk -- `app` is "the only crate allowed to depend on `tauri`" per its own
+/// Cargo.toml description, so the `tauri::AppHandle`-dependent path lookup can't live in
+/// `session` without giving it that same dependency.
+fn load_settings_impl(config_dir: &Path) -> session::Settings {
+    session::load_settings(config_dir)
+}
+
+fn save_settings_impl(config_dir: &Path, settings: &session::Settings) -> Result<(), String> {
+    session::save_settings(config_dir, settings)
+}
+
+#[tauri::command]
+fn load_settings(app: tauri::AppHandle) -> session::Settings {
+    match app.path().app_config_dir() {
+        Ok(dir) => load_settings_impl(&dir),
+        // No usable config dir (unexpected on a real desktop install) -- defaults are the only
+        // sane fallback, same reasoning as `session::load_settings`'s own corrupt-file case.
+        Err(_) => session::Settings::default(),
+    }
+}
+
+#[tauri::command]
+fn save_settings(app: tauri::AppHandle, settings: session::Settings) -> Result<(), String> {
+    let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    save_settings_impl(&dir, &settings)?;
+    // Best-effort: if no window is listening (or the settings window is the only one open and
+    // has no listener registered yet), there's nothing else to do -- the new value is already
+    // durably saved, and the next window to open reads it fresh via `load_settings` regardless.
+    let _ = app.emit("settings-changed", settings);
+    Ok(())
+}
+
+/// Opens the settings window (docs/UI/ui-02.png), or focuses it if already open -- a second
+/// `WebviewWindowBuilder::new` call with the same label would error, so this checks first rather
+/// than letting that error surface as a confusing failure to the frontend.
+#[tauri::command]
+fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("settings") {
+        return window.set_focus().map_err(|e| e.to_string());
+    }
+    WebviewWindowBuilder::new(&app, "settings", WebviewUrl::App("settings".into()))
+        .title("Settings")
+        .inner_size(560.0, 420.0)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Installs a fresh cancel flag as *the* current scan, replacing whatever was there before (a
@@ -552,6 +609,41 @@ mod tests {
     }
 
     #[test]
+    fn settings_wiring_round_trips_through_this_crate_the_same_way_session_does() {
+        let dir = std::env::temp_dir().join(format!("diffgrid-test-{}-app-settings", std::process::id()));
+        let settings =
+            session::Settings { ignore_whitespace: true, ignore_case: false, collapse_context_lines: 5, intra_line_mode: session::IntraLineMode::Word };
+        save_settings_impl(&dir, &settings).unwrap();
+        assert_eq!(load_settings_impl(&dir), settings);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn intra_line_spans_off_mode_returns_no_spans_even_for_differing_lines() {
+        let spans = intra_line_spans("foo".to_string(), "bar".to_string(), false, false, session::IntraLineMode::Off);
+        assert_eq!(spans, vec![]);
+    }
+
+    #[test]
+    fn intra_line_spans_dispatches_to_word_mode() {
+        let spans = intra_line_spans("foo bar baz".to_string(), "foo XXX baz".to_string(), false, false, session::IntraLineMode::Word);
+        // word mode finds a single disjoint changed-word span per side; character mode's
+        // prefix/suffix trim would produce the same result for this single-word-diff input too,
+        // so this specifically pins that the mode parameter reaches diff_core, not just that
+        // *some* span comes back.
+        assert_eq!(spans.len(), 2);
+    }
+
+    #[test]
+    fn intra_line_spans_dispatches_to_character_mode() {
+        let spans = intra_line_spans("foo bar baz".to_string(), "foo XXX baz".to_string(), false, false, session::IntraLineMode::Character);
+        assert_eq!(
+            spans,
+            diff_core::intra_line_spans_with_options("foo bar baz", "foo XXX baz", diff_core::DiffOptions::default())
+        );
+    }
+
+    #[test]
     fn register_new_scan_installs_a_fresh_unset_flag_each_time() {
         let state = ScanState::default();
         let first = register_new_scan(&state);
@@ -621,7 +713,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             diff_fixture, fixture_text, report_ready, report_bench, report_error, bench_flags,
             open_file_pair, open_file_text, launch_args, intra_line_spans, apply_edit, redo_diff,
-            save_file, path_kind, scan_dirs, cancel_scan, close_tab
+            save_file, path_kind, scan_dirs, cancel_scan, close_tab, load_settings, save_settings,
+            open_settings_window
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
