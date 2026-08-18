@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -5,16 +6,26 @@ use serde::Serialize;
 use session::EditBuffer;
 use tauri::ipc::{Channel, Response};
 
-/// M2's in-memory edit state for the single open file pair (per docs/PLAN.md §5 — no session
-/// shell/multi-tab yet, so exactly one left/right pair). `None` before any file is opened (the
-/// M0 benchmark flow never populates this). A plain `Mutex`, not `RwLock`: every access either
-/// mutates (`apply_edit`, `open_file_pair`) or needs a consistent snapshot across both sides
-/// (`redo_diff`, `save_file`), so there's no read-heavy case that would benefit from a
-/// reader/writer split.
+type TabId = String;
+
+/// One open file-pair tab's edit state. Both sides live under the *same* map entry (and so the
+/// same lock, held via `SessionState.tabs`) rather than each having its own `Mutex` the way M2's
+/// single-pair `SessionState` did -- that's what makes `redo_diff_impl` trivially consistent now
+/// (one lock covers both sides, so there's no way to observe a left snapshot from one instant and
+/// a right snapshot from another) without the careful "lock both, in a fixed order" discipline
+/// the M2 version needed. See DECISIONS.md for why the coarser per-tab lock (vs. per-side) is the
+/// right trade for a single-user desktop app with no read-heavy contention case.
+struct TabBuffers {
+    left: EditBuffer,
+    right: EditBuffer,
+}
+
+/// M4's in-memory edit state: one `TabBuffers` per open file-pair tab, keyed by a frontend-
+/// generated `TabId` (per docs/PLAN.md §5 -- multiple open-file edit buffers, not just one).
+/// Closing a tab (`close_tab`) removes its entry entirely, freeing the `EditBuffer`s.
 #[derive(Default)]
 struct SessionState {
-    left: Mutex<Option<EditBuffer>>,
-    right: Mutex<Option<EditBuffer>>,
+    tabs: Mutex<HashMap<TabId, TabBuffers>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -108,21 +119,38 @@ fn diff_pair(left_bytes: &[u8], right_bytes: &[u8]) -> Result<OpenPairResult, St
 
 /// M1: `diffgrid FILE1 FILE2` real-file entry point (see `launch_args`). Reads both files,
 /// runs binary refusal + encoding/line-ending detection via `text-io`, then diffs the
-/// normalized text. M2: also seeds `SessionState` with a fresh `EditBuffer` per side (holding
-/// the raw bytes just read, for an exact-byte-identical unedited save — see `EditBuffer`),
-/// replacing whatever was open before. Still a single file pair, no directories/session shell.
+/// normalized text. M2: also seeds a fresh `EditBuffer` pair (holding the raw bytes just read,
+/// for an exact-byte-identical unedited save — see `EditBuffer`). M4: keyed by `tab_id`, so
+/// opening a pair never disturbs any other tab's buffers -- inserting under an id that's already
+/// present replaces just that tab, same as it always implicitly did for the single-tab case.
 #[tauri::command]
-fn open_file_pair(state: tauri::State<SessionState>, left: String, right: String) -> Result<OpenPairResult, String> {
+fn open_file_pair(state: tauri::State<SessionState>, tab_id: String, left: String, right: String) -> Result<OpenPairResult, String> {
     let left_bytes = std::fs::read(&left).map_err(|e| format!("{left}: {e}"))?;
     let right_bytes = std::fs::read(&right).map_err(|e| format!("{right}: {e}"))?;
     let result = diff_pair(&left_bytes, &right_bytes)?;
 
     let left_loaded = text_io::load(&left_bytes);
     let right_loaded = text_io::load(&right_bytes);
-    *state.left.lock().unwrap() = Some(EditBuffer::new(&left_loaded.normalized, left_bytes, left_loaded.meta));
-    *state.right.lock().unwrap() = Some(EditBuffer::new(&right_loaded.normalized, right_bytes, right_loaded.meta));
+    let buffers = TabBuffers {
+        left: EditBuffer::new(&left_loaded.normalized, left_bytes, left_loaded.meta),
+        right: EditBuffer::new(&right_loaded.normalized, right_bytes, right_loaded.meta),
+    };
+    state.tabs.lock().unwrap().insert(tab_id, buffers);
 
     Ok(result)
+}
+
+fn close_tab_impl(state: &SessionState, tab_id: &str) {
+    state.tabs.lock().unwrap().remove(tab_id);
+}
+
+/// Drops a tab's `EditBuffer` pair entirely, freeing the memory. A no-op (not an error) if the
+/// id is unknown -- same "nothing to signal, nothing to do" reasoning as `cancel_scan`'s
+/// no-op-when-nothing's-running case, since the frontend has no reason to distinguish "already
+/// closed" from "never existed" when it's just cleaning up after itself.
+#[tauri::command]
+fn close_tab(state: tauri::State<SessionState>, tab_id: String) {
+    close_tab_impl(&state, &tab_id)
 }
 
 /// Companion to `open_file_pair`: the normalized (BOM-stripped, LF-normalized) full text of
@@ -164,81 +192,77 @@ fn intra_line_spans(
 /// Core of `apply_edit`, taking a plain `&SessionState` rather than `tauri::State` so it's
 /// callable from unit tests without a running app (`tauri::State` has no public constructor —
 /// same rationale as `diff_pair` being split out from its `#[tauri::command]` wrapper above).
-fn apply_edit_impl(state: &SessionState, side: Side, from_utf16: u32, to_utf16: u32, inserted: &str) -> Result<(), String> {
-    let mutex = match side {
-        Side::Left => &state.left,
-        Side::Right => &state.right,
+fn apply_edit_impl(state: &SessionState, tab_id: &str, side: Side, from_utf16: u32, to_utf16: u32, inserted: &str) -> Result<(), String> {
+    let mut tabs = state.tabs.lock().unwrap();
+    let buffers = tabs.get_mut(tab_id).ok_or("no tab open with this id")?;
+    let buffer = match side {
+        Side::Left => &mut buffers.left,
+        Side::Right => &mut buffers.right,
     };
-    let mut guard = mutex.lock().unwrap();
-    let buffer = guard.as_mut().ok_or("no file open on this side")?;
     buffer.apply_delta(from_utf16, to_utf16, inserted)
 }
 
 /// Applies one edit delta captured from a CM6 transaction to the corresponding side's
 /// `EditBuffer` — the frontend → Rust half of the delta pipeline in docs/PLAN.md §2. Errors if
-/// no file pair is open yet, or if the offsets are malformed (see `EditBuffer::apply_delta`).
+/// `tab_id` isn't open, or if the offsets are malformed (see `EditBuffer::apply_delta`).
 ///
-/// Caller contract: deltas from a single side must be sent in the order CM6 produced them, and
-/// each call's `from_utf16`/`to_utf16` must be valid against the buffer state left by the
-/// previous call — never issued concurrently for the same side, or the shadow buffer diverges
-/// from CM6's real document silently (a divergence that only surfaces later, as a bad save).
+/// Caller contract: deltas from a single side of a single tab must be sent in the order CM6
+/// produced them, and each call's `from_utf16`/`to_utf16` must be valid against the buffer state
+/// left by the previous call for that same side — never issued concurrently for the same
+/// (tab, side), or the shadow buffer diverges from CM6's real document silently (a divergence
+/// that only surfaces later, as a bad save). Different tabs are fully independent.
 #[tauri::command]
-fn apply_edit(state: tauri::State<SessionState>, side: Side, from_utf16: u32, to_utf16: u32, inserted: String) -> Result<(), String> {
-    apply_edit_impl(&state, side, from_utf16, to_utf16, &inserted)
+fn apply_edit(state: tauri::State<SessionState>, tab_id: String, side: Side, from_utf16: u32, to_utf16: u32, inserted: String) -> Result<(), String> {
+    apply_edit_impl(&state, &tab_id, side, from_utf16, to_utf16, &inserted)
 }
 
-/// Holds *both* locks for the whole read, not one at a time: `state.left.lock().unwrap().as_ref()
-/// ...text()` as a single expression would drop the left guard before acquiring the right one,
-/// leaving a real gap where a concurrent `apply_edit` on either side (Tauri commands aren't
-/// guaranteed to run serialized) could land -- diffing a left snapshot from time T against a
-/// right snapshot from time T+1. That produces a `FileDiffResult` whose `LineRange`s don't
-/// correspond to either pane's actual current content, which then feeds straight into
-/// `buildCollapseRanges`/`spansToMarkRanges` on the frontend -- the same "hunk metadata silently
-/// stops matching the text it claims to describe" failure class as the earlier UTF-16 and serde
-/// bugs, just from a torn read instead of a wire-format mismatch. Always lock left before right
-/// here (and nowhere else in this file locks both at once) so this can't deadlock against another
-/// caller locking in the opposite order.
-fn redo_diff_impl(state: &SessionState, ignore_whitespace: bool, ignore_case: bool) -> Result<diff_core::FileDiffResult, String> {
-    let left_guard = state.left.lock().unwrap();
-    let right_guard = state.right.lock().unwrap();
-    let left = left_guard.as_ref().ok_or("no file open on the left")?.text();
-    let right = right_guard.as_ref().ok_or("no file open on the right")?.text();
+/// Reads both sides of one tab under a single lock acquisition (`state.tabs.lock()` once, for
+/// the whole read) -- unlike M2's separate per-side `Mutex`es, there is no way to observe a left
+/// snapshot from one instant and a right snapshot from another, because both live in the same
+/// map entry behind the same lock. See `TabBuffers`'s doc comment for why this is a strict
+/// improvement over the "lock both, in a fixed order" discipline the old dual-`Mutex` shape
+/// needed to avoid exactly this hazard.
+fn redo_diff_impl(state: &SessionState, tab_id: &str, ignore_whitespace: bool, ignore_case: bool) -> Result<diff_core::FileDiffResult, String> {
+    let tabs = state.tabs.lock().unwrap();
+    let buffers = tabs.get(tab_id).ok_or("no tab open with this id")?;
+    let left = buffers.left.text();
+    let right = buffers.right.text();
     Ok(diff_core::diff_lines_with_options(&left, &right, diff_core::DiffOptions { ignore_whitespace, ignore_case }))
 }
 
-/// Re-diffs the two open `EditBuffer`s' *current* text (i.e. including any edits applied via
-/// `apply_edit` since open) with whitespace/case-ignore toggles applied. Replaces M1's
+/// Re-diffs one tab's two open `EditBuffer`s' *current* text (i.e. including any edits applied
+/// via `apply_edit` since open) with whitespace/case-ignore toggles applied. Replaces M1's
 /// `diff_texts(left, right, ...)`, which took the text as parameters from the frontend — once
 /// editing exists, the frontend's own copy of the text can be stale the moment an edit lands,
 /// so the Rust-side `EditBuffer` (kept current by `apply_edit`) must be the one source of truth
 /// for what gets diffed, for the live-toggle case and the post-edit case alike.
 #[tauri::command]
-fn redo_diff(state: tauri::State<SessionState>, ignore_whitespace: bool, ignore_case: bool) -> Result<diff_core::FileDiffResult, String> {
-    redo_diff_impl(&state, ignore_whitespace, ignore_case)
+fn redo_diff(state: tauri::State<SessionState>, tab_id: String, ignore_whitespace: bool, ignore_case: bool) -> Result<diff_core::FileDiffResult, String> {
+    redo_diff_impl(&state, &tab_id, ignore_whitespace, ignore_case)
 }
 
-fn save_file_impl(state: &SessionState, side: Side, path: &str) -> Result<(), String> {
-    let mutex = match side {
-        Side::Left => &state.left,
-        Side::Right => &state.right,
+fn save_file_impl(state: &SessionState, tab_id: &str, side: Side, path: &str) -> Result<(), String> {
+    let mut tabs = state.tabs.lock().unwrap();
+    let buffers = tabs.get_mut(tab_id).ok_or("no tab open with this id")?;
+    let buffer = match side {
+        Side::Left => &mut buffers.left,
+        Side::Right => &mut buffers.right,
     };
-    let mut guard = mutex.lock().unwrap();
-    let buffer = guard.as_mut().ok_or("no file open on this side")?;
     let bytes = buffer.to_bytes()?;
     std::fs::write(path, &bytes).map_err(|e| format!("{path}: {e}"))?;
     buffer.mark_saved(bytes);
     Ok(())
 }
 
-/// Writes the current state of one side's `EditBuffer` to `path`, encoding/line-ending-preserving
-/// per docs/PLAN.md §2: an unedited buffer writes back its exact original bytes; an edited one
-/// re-encodes into the original encoding/line-ending style (see `text_io::to_bytes`). On success,
-/// the buffer adopts the just-written bytes as its new baseline (`EditBuffer::mark_saved`), so a
-/// later unedited save short-circuits again instead of re-encoding every time regardless of
-/// whether anything changed since the last save.
+/// Writes the current state of one tab's one side's `EditBuffer` to `path`, encoding/line-ending-
+/// preserving per docs/PLAN.md §2: an unedited buffer writes back its exact original bytes; an
+/// edited one re-encodes into the original encoding/line-ending style (see `text_io::to_bytes`).
+/// On success, the buffer adopts the just-written bytes as its new baseline
+/// (`EditBuffer::mark_saved`), so a later unedited save short-circuits again instead of
+/// re-encoding every time regardless of whether anything changed since the last save.
 #[tauri::command]
-fn save_file(state: tauri::State<SessionState>, side: Side, path: String) -> Result<(), String> {
-    save_file_impl(&state, side, &path)
+fn save_file(state: tauri::State<SessionState>, tab_id: String, side: Side, path: String) -> Result<(), String> {
+    save_file_impl(&state, &tab_id, side, &path)
 }
 
 /// Lets the frontend branch `diffgrid ARG1 ARG2` between M1/M2's file-pair view and M3's
@@ -381,13 +405,22 @@ mod tests {
         assert_eq!(result.right_meta.encoding, text_io::Encoding::Utf16Le);
     }
 
+    const TAB: &str = "tab-1";
+
     fn opened_state(left: &str, right: &str) -> SessionState {
+        opened_state_with_id(TAB, left, right)
+    }
+
+    fn opened_state_with_id(tab_id: &str, left: &str, right: &str) -> SessionState {
         let left_loaded = text_io::load(left.as_bytes());
         let right_loaded = text_io::load(right.as_bytes());
-        SessionState {
-            left: Mutex::new(Some(EditBuffer::new(&left_loaded.normalized, left.as_bytes().to_vec(), left_loaded.meta))),
-            right: Mutex::new(Some(EditBuffer::new(&right_loaded.normalized, right.as_bytes().to_vec(), right_loaded.meta))),
-        }
+        let buffers = TabBuffers {
+            left: EditBuffer::new(&left_loaded.normalized, left.as_bytes().to_vec(), left_loaded.meta),
+            right: EditBuffer::new(&right_loaded.normalized, right.as_bytes().to_vec(), right_loaded.meta),
+        };
+        let state = SessionState::default();
+        state.tabs.lock().unwrap().insert(tab_id.to_string(), buffers);
+        state
     }
 
     /// Exercises the exact sequence the frontend's edit pipeline relies on: an edit lands via
@@ -397,27 +430,27 @@ mod tests {
     #[test]
     fn redo_diff_reflects_an_edit_applied_since_open() {
         let state = opened_state("a\nb\nc\n", "a\nb\nc\n");
-        let diff = redo_diff_impl(&state, false, false).unwrap();
+        let diff = redo_diff_impl(&state, TAB, false, false).unwrap();
         assert_eq!(diff.stats.chunks, 0, "no edits yet -- must still diff as identical");
 
-        apply_edit_impl(&state, Side::Left, 2, 3, "X").unwrap();
-        let diff = redo_diff_impl(&state, false, false).unwrap();
+        apply_edit_impl(&state, TAB, Side::Left, 2, 3, "X").unwrap();
+        let diff = redo_diff_impl(&state, TAB, false, false).unwrap();
         assert_eq!(diff.stats.chunks, 1, "the edit must be visible to a re-diff without re-sending text from the frontend");
     }
 
     #[test]
     fn redo_diff_honors_ignore_whitespace_after_an_edit() {
         let state = opened_state("a\nfoo\nc\n", "a\nfoo\nc\n");
-        apply_edit_impl(&state, Side::Right, 6, 6, "   ").unwrap();
-        let diff = redo_diff_impl(&state, true, false).unwrap();
+        apply_edit_impl(&state, TAB, Side::Right, 6, 6, "   ").unwrap();
+        let diff = redo_diff_impl(&state, TAB, true, false).unwrap();
         assert_eq!(diff.stats.chunks, 0, "a whitespace-only edit must not count as a hunk under ignore_whitespace");
     }
 
     #[test]
-    fn apply_edit_errors_when_no_file_is_open_on_that_side() {
+    fn apply_edit_errors_when_no_tab_is_open_with_that_id() {
         let state = SessionState::default();
-        let err = apply_edit_impl(&state, Side::Left, 0, 0, "x").unwrap_err();
-        assert!(err.contains("no file open"));
+        let err = apply_edit_impl(&state, TAB, Side::Left, 0, 0, "x").unwrap_err();
+        assert!(err.contains("no tab"));
     }
 
     #[test]
@@ -426,7 +459,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("diffgrid-test-{}-a", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("left.txt");
-        save_file_impl(&state, Side::Left, path.to_str().unwrap()).unwrap();
+        save_file_impl(&state, TAB, Side::Left, path.to_str().unwrap()).unwrap();
         let written = std::fs::read(&path).unwrap();
         assert_eq!(written, b"a\r\nb\r\nc\r\n", "an unedited save must reproduce the original CRLF bytes exactly");
         std::fs::remove_dir_all(&dir).ok();
@@ -435,17 +468,71 @@ mod tests {
     #[test]
     fn save_file_reencodes_and_marks_clean_after_an_edit() {
         let state = opened_state("a\nb\nc\n", "a\nb\nc\n");
-        apply_edit_impl(&state, Side::Left, 0, 1, "X").unwrap();
+        apply_edit_impl(&state, TAB, Side::Left, 0, 1, "X").unwrap();
         let dir = std::env::temp_dir().join(format!("diffgrid-test-{}-b", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("left.txt");
-        save_file_impl(&state, Side::Left, path.to_str().unwrap()).unwrap();
+        save_file_impl(&state, TAB, Side::Left, path.to_str().unwrap()).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"X\nb\nc\n");
         // a second save with no further edits must now short-circuit to *these* bytes, not
         // silently re-diverge -- i.e. mark_saved really updated the baseline.
-        save_file_impl(&state, Side::Left, path.to_str().unwrap()).unwrap();
+        save_file_impl(&state, TAB, Side::Left, path.to_str().unwrap()).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"X\nb\nc\n");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole point of keying `SessionState` by `TabId`: editing one tab must never leak into
+    /// another's buffers, even though both live in the same `HashMap` behind the same lock.
+    #[test]
+    fn two_tabs_have_fully_independent_buffers() {
+        let state = SessionState::default();
+        state.tabs.lock().unwrap().insert("a".to_string(), {
+            let l = text_io::load(b"a\nb\nc\n");
+            let r = text_io::load(b"a\nb\nc\n");
+            TabBuffers { left: EditBuffer::new(&l.normalized, b"a\nb\nc\n".to_vec(), l.meta), right: EditBuffer::new(&r.normalized, b"a\nb\nc\n".to_vec(), r.meta) }
+        });
+        state.tabs.lock().unwrap().insert("b".to_string(), {
+            let l = text_io::load(b"x\ny\nz\n");
+            let r = text_io::load(b"x\ny\nz\n");
+            TabBuffers { left: EditBuffer::new(&l.normalized, b"x\ny\nz\n".to_vec(), l.meta), right: EditBuffer::new(&r.normalized, b"x\ny\nz\n".to_vec(), r.meta) }
+        });
+
+        apply_edit_impl(&state, "a", Side::Left, 0, 1, "X").unwrap();
+
+        let diff_a = redo_diff_impl(&state, "a", false, false).unwrap();
+        let diff_b = redo_diff_impl(&state, "b", false, false).unwrap();
+        assert_eq!(diff_a.stats.chunks, 1, "tab a's edit must be visible in tab a's diff");
+        assert_eq!(diff_b.stats.chunks, 0, "tab a's edit must not leak into tab b, which was never touched");
+    }
+
+    #[test]
+    fn close_tab_removes_the_entry_so_apply_edit_then_errors() {
+        let state = opened_state("a\nb\n", "a\nb\n");
+        close_tab_impl(&state, TAB);
+        let err = apply_edit_impl(&state, TAB, Side::Left, 0, 0, "x").unwrap_err();
+        assert!(err.contains("no tab"));
+    }
+
+    #[test]
+    fn close_tab_is_a_harmless_no_op_for_an_unknown_id() {
+        let state = SessionState::default();
+        close_tab_impl(&state, "does-not-exist"); // must not panic
+        assert!(state.tabs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn close_tab_only_removes_the_named_tab() {
+        let state = opened_state_with_id("a", "1\n", "1\n");
+        state.tabs.lock().unwrap().insert(
+            "b".to_string(),
+            TabBuffers {
+                left: EditBuffer::new("2\n", b"2\n".to_vec(), text_io::load(b"2\n").meta),
+                right: EditBuffer::new("2\n", b"2\n".to_vec(), text_io::load(b"2\n").meta),
+            },
+        );
+        close_tab_impl(&state, "a");
+        assert!(apply_edit_impl(&state, "a", Side::Left, 0, 0, "x").is_err());
+        assert!(redo_diff_impl(&state, "b", false, false).is_ok(), "closing tab a must not disturb tab b");
     }
 
     #[test]
@@ -534,7 +621,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             diff_fixture, fixture_text, report_ready, report_bench, report_error, bench_flags,
             open_file_pair, open_file_text, launch_args, intra_line_spans, apply_edit, redo_diff,
-            save_file, path_kind, scan_dirs, cancel_scan
+            save_file, path_kind, scan_dirs, cancel_scan, close_tab
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
