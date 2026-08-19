@@ -77,3 +77,19 @@ export interface Settings {
   autoResolveNonConflicting: boolean;
   defaultTakeBothSide: TakeBothSide;
 }
+
+export type MergeHunkKind = "autoMerged" | "conflict";
+export type Resolution = "takeLocal" | "takeRemote" | "takeBoth" | "takeBase" | "manual";
+
+export interface MergeHunk {
+  kind: MergeHunkKind;
+  base: LineRange;
+  local: LineRange;
+  remote: LineRange;
+  resolution: Resolution | null;
+}
+
+export interface OpenMergeResult {
+  hunks: MergeHunk[];
+  mergedText: string;
+}
