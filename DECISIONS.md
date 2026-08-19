@@ -730,3 +730,45 @@ the live CM6 buffer is authoritative for it, same principle as M2's `EditBuffer`
 `Manual` match arm to panic with an explanatory message rather than silently producing wrong
 output, and added a test (`build_merged_text_panics_on_a_manual_resolution`) asserting that
 contract explicitly rather than leaving it undocumented.
+
+## 2026-08-19 — M5 merge resolution: CM6 tracks hunk position, Rust never does (a design reversal caught before implementation)
+
+**Decision**: `merge-core::MergeHunk` does NOT carry a "current position in the merged document"
+field. A resolution click's flow is: frontend sends `(tab_id, hunk_index, resolution)` to the new
+`resolve_merge_hunk` command, which updates that hunk's `resolution` in Rust-side `MergeTab.hunks`
+and returns just the resolved *text* for that hunk (via the new `merge_core::resolve_hunk_text`,
+extracted from `build_merged_text`) -- the frontend is responsible for knowing that hunk's current
+`{from, to}` character range in the live merged CM6 document and dispatching a normal CM6
+transaction to replace it, through the exact same edit pipeline (`apply_merge_edit`, structurally
+identical to M2's `apply_edit`) a real keystroke uses.
+
+**Why**: my first draft added `pub merged: LineRange` to `MergeHunk`, meant to be kept in sync by
+a Rust-side `resolve_hunk` function on every resolution change (shifting every later hunk's
+`merged` range by the length delta each earlier resolution introduced). Caught before
+implementation: this is Rust re-deriving a "shadow position" for content CM6 already tracks
+natively via `ChangeSet`/`RangeSet` position-mapping -- the exact "shadow state that can drift"
+failure class this project already hit once and reverted (the M0 alignment-mapping mechanism,
+`map(map(x)) ≠ x` — see the "Reverted a measured performance win" entry above). M2's own
+`buildHunkCopyChange` already solves this exact problem client-side for the two-pane diff view
+(computing `{from, to, insert}` from CM6 `Text` positions, dispatched through the normal edit
+pipeline) — merge resolution is the same shape of problem, so it gets the same shape of solution,
+not a new Rust-side position-tracking mechanism.
+
+**How to apply**: `resolve_hunk_text(base, local, remote, hunk, take_both_order)` is now the one
+place resolution-content logic lives, called both by `build_merged_text` (the initial seed, for
+every already-resolved hunk) and by `resolve_merge_hunk` (a later resolution change, for one
+hunk) -- the two paths can never compute a hunk's resolved text two different ways, since there's
+only one function that does it. `resolve_hunk_text` panics on `Manual` or an unresolved `Conflict`
+(`None`) -- both are real caller-contract violations (a `Manual` hunk's content isn't derivable
+from LineRanges at all; an unresolved conflict must be surfaced to the user, never silently
+resolved) -- while `build_merged_text` is the one legitimate exception, treating an unresolved
+`Conflict` as "show base content as an initial placeholder" since it's building a first-paint
+document that must render something for every hunk.
+
+**`resolve_merge_hunk`/`mark_merge_hunk_manual`/`apply_merge_edit` are three separate commands,
+not one**: a resolution-action click (TakeLocal/TakeRemote/TakeBoth/TakeBase) calls
+`resolve_merge_hunk` first (Rust decides the new text, frontend dispatches it), while a Manual
+edit is the reverse (frontend's own edit already happened via `apply_merge_edit`, then
+`mark_merge_hunk_manual` just flips that hunk's resolution flag with no text computation at all,
+since the CM6 buffer already has the real content). Collapsing these into one command would force
+either path to fake data the other doesn't have.

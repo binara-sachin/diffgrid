@@ -1,5 +1,5 @@
 use diff_core::{diff_lines, HunkKind, LineRange};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -8,7 +8,7 @@ pub enum MergeHunkKind {
     Conflict,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Resolution {
     TakeLocal,
@@ -169,6 +169,63 @@ pub enum TakeBothOrder {
 /// TakeLocal/TakeRemote/TakeBoth/TakeBase click, rather than re-deriving the whole document from
 /// scratch. Calling this function again after any hunk has gone `Manual` is therefore a caller
 /// bug, not a supported "recompute" path -- see the `Manual` match arm's panic below.
+/// Resolves one hunk to the text `resolution` dictates -- the single source of truth both
+/// `build_merged_text`'s initial seed and a later resolution-change command use, so the two paths
+/// can never compute a hunk's content two different ways. Panics on `Some(Resolution::Manual)`
+/// or `None` for a `Conflict` hunk -- see `build_merged_text`'s doc comment for why: neither has
+/// text derivable from `base`/`local`/`remote` `LineRange`s alone, and a caller reaching this
+/// path is a bug (an unresolved conflict must be surfaced to the user, never silently resolved to
+/// something), not a case to paper over.
+pub fn resolve_hunk_text(base: &str, local: &str, remote: &str, hunk: &MergeHunk, take_both_order: TakeBothOrder) -> String {
+    match hunk.resolution {
+        Some(Resolution::TakeLocal) => extract_lines(local, hunk.local),
+        Some(Resolution::TakeRemote) => extract_lines(remote, hunk.remote),
+        Some(Resolution::TakeBoth) => {
+            let local_text = extract_lines(local, hunk.local);
+            let remote_text = extract_lines(remote, hunk.remote);
+            let (first, second) = match take_both_order {
+                TakeBothOrder::LocalFirst => (local_text, remote_text),
+                TakeBothOrder::RemoteFirst => (remote_text, local_text),
+            };
+            if first.is_empty() { second } else if second.is_empty() { first } else { format!("{first}\n{second}") }
+        }
+        Some(Resolution::TakeBase) => extract_lines(base, hunk.base),
+        Some(Resolution::Manual) => panic!(
+            "Manual resolution has no derivable text from base/local/remote LineRanges -- \
+             the merged-pane CM6 buffer is authoritative once a hunk is Manual, so \
+             resolve_hunk_text must not be called again for it"
+        ),
+        None => panic!(
+            "an unresolved Conflict hunk has no text to resolve to -- the caller must surface \
+             this to the user rather than reaching resolve_hunk_text for it"
+        ),
+    }
+}
+
+/// Builds the *initial* merged output text by walking `merge_hunks` in base order, taking the
+/// untouched base content between hunks verbatim and, for each hunk, `resolve_hunk_text`'s
+/// result -- except an unresolved `Conflict` hunk (`resolution: None`), which takes the base's
+/// own content for that region as a placeholder here specifically (this is the one caller allowed
+/// to treat `None` as "not yet decided, show something" rather than a bug, since it's building a
+/// first-paint document that must render *something* for every hunk); the frontend is responsible
+/// for surfacing that it's still unresolved before write-back, per docs/PLAN.md's
+/// write-back-with-correct-exit-status requirement. `merge_hunks` must be the exact list
+/// `compute_merge_hunks` returned for this same `(base, local, remote)` triple -- the
+/// `local`/`remote`/`base` LineRanges only make sense against those specific texts.
+///
+/// This seeds the merged-pane CM6 buffer once, at merge-view open (same role `open_file_pair`
+/// plays for M1/M2's two-pane view) -- it is NOT re-invoked on every resolution change. Once the
+/// merged pane exists, CM6's document is authoritative for it (same principle as M2's `EditBuffer`
+/// for a two-way diff): a resolution click computes just that hunk's new text (via
+/// `resolve_hunk_text`) and the frontend dispatches a normal CM6 transaction replacing that
+/// hunk's *current* character range in the live document -- the same mechanism M2's
+/// `buildHunkCopyChange` already uses for copying a hunk between the two-pane view's panes, and
+/// the same reason neither `MergeHunk` nor this crate tracks a hunk's position within the merged
+/// document itself: CM6's own `ChangeSet`/`RangeSet` position-mapping already keeps every other
+/// hunk's boundaries correct through an edit, for free, and duplicating that in Rust would be
+/// exactly the "shadow state that can drift" bug class this project has already hit once (see
+/// DECISIONS.md's M0 alignment-mapping revert). Calling `build_merged_text` again after any hunk
+/// has gone `Manual` is therefore a caller bug, not a supported "recompute" path.
 pub fn build_merged_text(base: &str, local: &str, remote: &str, merge_hunks: &[MergeHunk], take_both_order: TakeBothOrder) -> String {
     let base_lines: Vec<&str> = base.split('\n').collect();
     let mut out_lines: Vec<String> = Vec::new();
@@ -178,25 +235,7 @@ pub fn build_merged_text(base: &str, local: &str, remote: &str, merge_hunks: &[M
         if h.base.start > base_cursor {
             out_lines.extend(base_lines[base_cursor as usize..h.base.start as usize].iter().map(|s| s.to_string()));
         }
-        let resolved = match h.resolution {
-            Some(Resolution::TakeLocal) => extract_lines(local, h.local),
-            Some(Resolution::TakeRemote) => extract_lines(remote, h.remote),
-            Some(Resolution::TakeBoth) => {
-                let local_text = extract_lines(local, h.local);
-                let remote_text = extract_lines(remote, h.remote);
-                let (first, second) = match take_both_order {
-                    TakeBothOrder::LocalFirst => (local_text, remote_text),
-                    TakeBothOrder::RemoteFirst => (remote_text, local_text),
-                };
-                if first.is_empty() { second } else if second.is_empty() { first } else { format!("{first}\n{second}") }
-            }
-            Some(Resolution::TakeBase) | None => extract_lines(base, h.base),
-            Some(Resolution::Manual) => panic!(
-                "Manual resolution has no derivable text from base/local/remote LineRanges -- \
-                 the merged-pane CM6 buffer is authoritative once a hunk is Manual, so \
-                 build_merged_text must not be called again for it"
-            ),
-        };
+        let resolved = if h.resolution.is_none() { extract_lines(base, h.base) } else { resolve_hunk_text(base, local, remote, h, take_both_order) };
         if !resolved.is_empty() {
             out_lines.extend(resolved.split('\n').map(|s| s.to_string()));
         }
@@ -386,6 +425,28 @@ mod tests {
         let mut hunks = compute_merge_hunks(base, local, remote);
         hunks[0].resolution = Some(Resolution::Manual);
         build_merged_text(base, local, remote, &hunks, TakeBothOrder::LocalFirst);
+    }
+
+    #[test]
+    fn resolve_hunk_text_returns_just_that_hunks_content_for_take_local() {
+        let base = "a\nb\nc\n";
+        let local = "a\nLOCAL\nc\n";
+        let remote = "a\nREMOTE\nc\n";
+        let hunks = compute_merge_hunks(base, local, remote);
+        let mut hunk = hunks[0].clone();
+        hunk.resolution = Some(Resolution::TakeLocal);
+        assert_eq!(resolve_hunk_text(base, local, remote, &hunk, TakeBothOrder::LocalFirst), "LOCAL");
+    }
+
+    #[test]
+    #[should_panic(expected = "unresolved Conflict")]
+    fn resolve_hunk_text_panics_on_an_unresolved_conflict() {
+        let base = "a\nb\nc\n";
+        let local = "a\nLOCAL\nc\n";
+        let remote = "a\nREMOTE\nc\n";
+        let hunks = compute_merge_hunks(base, local, remote);
+        assert_eq!(hunks[0].resolution, None);
+        resolve_hunk_text(base, local, remote, &hunks[0], TakeBothOrder::LocalFirst);
     }
 
     #[test]

@@ -154,6 +154,174 @@ fn close_tab(state: tauri::State<SessionState>, tab_id: String) {
     close_tab_impl(&state, &tab_id)
 }
 
+/// One open three-way merge tab's state (M5, per docs/PLAN.md §5's `merge-core` module and the
+/// BASE/LOCAL/REMOTE + merged-output view). `base`/`local`/`remote` are read-only after open, so
+/// they're stored as plain `String`, not `EditBuffer` -- only `merged` is ever edited. `hunks` is
+/// the current classification; `resolution` on each entry is mutated by `set_merge_resolution`
+/// and, unlike M1-M4's diff hunks, is NOT recomputed by re-diffing -- a merge hunk's identity and
+/// boundaries are fixed at open time (per `merge-core`'s own doc comment on `build_merged_text`:
+/// it seeds the merged buffer once, and any resolution beyond that is a targeted edit, not a
+/// re-diff).
+struct MergeTab {
+    base: String,
+    local: String,
+    remote: String,
+    hunks: Vec<merge_core::MergeHunk>,
+    merged: EditBuffer,
+}
+
+#[derive(Default)]
+struct MergeState {
+    tabs: Mutex<HashMap<TabId, MergeTab>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenMergeResult {
+    hunks: Vec<merge_core::MergeHunk>,
+    merged_text: String,
+}
+
+/// Pure over already-read bytes, same split as `diff_pair`/`open_file_pair`. `local`'s `FileMeta`
+/// (encoding/line-ending) is what the merged output is written back with on save -- `local` is
+/// the side whose original file path the merge result overwrites, per `git mergetool`'s own
+/// convention (MERGED starts as a copy of LOCAL). Refuses if any of the three sides is binary,
+/// same reasoning as `diff_pair`'s binary refusal.
+fn open_merge_pair(base_bytes: &[u8], local_bytes: &[u8], remote_bytes: &[u8], take_both_order: merge_core::TakeBothOrder) -> Result<(MergeTab, OpenMergeResult), String> {
+    let base = text_io::load(base_bytes);
+    let local = text_io::load(local_bytes);
+    let remote = text_io::load(remote_bytes);
+    if base.meta.is_binary || local.meta.is_binary || remote.meta.is_binary {
+        return Err("binary file: diffgrid does not merge binary files".to_string());
+    }
+
+    let hunks = merge_core::compute_merge_hunks(&base.normalized, &local.normalized, &remote.normalized);
+    let merged_text = merge_core::build_merged_text(&base.normalized, &local.normalized, &remote.normalized, &hunks, take_both_order);
+
+    let tab = MergeTab {
+        base: base.normalized,
+        local: local.normalized,
+        remote: remote.normalized,
+        hunks: hunks.clone(),
+        merged: EditBuffer::new(&merged_text, local_bytes.to_vec(), local.meta),
+    };
+    Ok((tab, OpenMergeResult { hunks, merged_text }))
+}
+
+/// Resolves one hunk (by index into `tab.hunks`) to a new value and returns the text the
+/// frontend must splice into the live merged CM6 buffer at that hunk's *current* position --
+/// per `merge-core::build_merged_text`'s doc comment, the frontend (not Rust) tracks each hunk's
+/// live character range, the same way M2's `buildHunkCopyChange` already does for the two-pane
+/// diff view; Rust never re-derives the whole merged document from this call. Returns an error
+/// for `Resolution::Manual` (that path doesn't go through this command at all -- see
+/// `mark_merge_hunk_manual`) and for an out-of-range index, rather than panicking on either, since
+/// both are plausible (if buggy) frontend-supplied values crossing the IPC boundary, not an
+/// internal invariant violation.
+fn resolve_merge_hunk_impl(tab: &mut MergeTab, hunk_index: usize, resolution: merge_core::Resolution, take_both_order: merge_core::TakeBothOrder) -> Result<String, String> {
+    if resolution == merge_core::Resolution::Manual {
+        return Err("Manual resolution is set via mark_merge_hunk_manual, not resolve_merge_hunk".to_string());
+    }
+    let hunk = tab.hunks.get_mut(hunk_index).ok_or_else(|| format!("no hunk at index {hunk_index}"))?;
+    hunk.resolution = Some(resolution);
+    Ok(merge_core::resolve_hunk_text(&tab.base, &tab.local, &tab.remote, hunk, take_both_order))
+}
+
+/// `session::TakeBothSide` -> `merge_core::TakeBothOrder`, the same translation pattern this
+/// file already uses for `session::IntraLineMode` -> `diff_core`'s word/character functions.
+fn take_both_order_from_setting(side: session::TakeBothSide) -> merge_core::TakeBothOrder {
+    match side {
+        session::TakeBothSide::MineFirst => merge_core::TakeBothOrder::LocalFirst,
+        session::TakeBothSide::TheirsFirst => merge_core::TakeBothOrder::RemoteFirst,
+    }
+}
+
+/// M5's merge-view entry point (docs/PLAN.md's BASE/LOCAL/REMOTE + merged-output view). Reads
+/// all three files, runs `open_merge_pair`, and stores the resulting `MergeTab` under `tab_id` --
+/// same per-tab-id keying convention as `open_file_pair`'s `SessionState`, kept as its own
+/// `MergeState`/`MergeTab` rather than folding into `TabBuffers` since a merge tab has three
+/// read-only sides plus one editable merged buffer, a genuinely different shape from a two-way
+/// diff tab's two editable sides.
+#[tauri::command]
+fn open_merge(state: tauri::State<MergeState>, tab_id: String, base: String, local: String, remote: String, take_both_side: session::TakeBothSide) -> Result<OpenMergeResult, String> {
+    let base_bytes = std::fs::read(&base).map_err(|e| format!("{base}: {e}"))?;
+    let local_bytes = std::fs::read(&local).map_err(|e| format!("{local}: {e}"))?;
+    let remote_bytes = std::fs::read(&remote).map_err(|e| format!("{remote}: {e}"))?;
+    let (tab, result) = open_merge_pair(&base_bytes, &local_bytes, &remote_bytes, take_both_order_from_setting(take_both_side))?;
+    state.tabs.lock().unwrap().insert(tab_id, tab);
+    Ok(result)
+}
+
+/// Resolves one hunk to a new value (TakeLocal/TakeRemote/TakeBoth/TakeBase -- not Manual, see
+/// `mark_merge_hunk_manual`) and returns the text the frontend splices into the live merged CM6
+/// buffer at that hunk's current position, per `resolve_merge_hunk_impl`'s doc comment.
+#[tauri::command]
+fn resolve_merge_hunk(
+    state: tauri::State<MergeState>,
+    tab_id: String,
+    hunk_index: usize,
+    resolution: merge_core::Resolution,
+    take_both_side: session::TakeBothSide,
+) -> Result<String, String> {
+    let mut tabs = state.tabs.lock().unwrap();
+    let tab = tabs.get_mut(&tab_id).ok_or_else(|| format!("no merge tab open with id {tab_id}"))?;
+    resolve_merge_hunk_impl(tab, hunk_index, resolution, take_both_order_from_setting(take_both_side))
+}
+
+/// Marks a hunk `Manual` after the frontend has already spliced the user's own edit into the
+/// merged buffer directly (or is about to) -- unlike `resolve_merge_hunk`, this never computes or
+/// returns replacement text, since `Manual` means the live CM6 buffer's own content for that
+/// hunk's range *is* the resolution; there's nothing for Rust to derive per `merge-core`'s
+/// `resolve_hunk_text` contract. Errors on an out-of-range index rather than panicking, same
+/// reasoning as `resolve_merge_hunk_impl`.
+#[tauri::command]
+fn mark_merge_hunk_manual(state: tauri::State<MergeState>, tab_id: String, hunk_index: usize) -> Result<(), String> {
+    let mut tabs = state.tabs.lock().unwrap();
+    let tab = tabs.get_mut(&tab_id).ok_or_else(|| format!("no merge tab open with id {tab_id}"))?;
+    let hunk = tab.hunks.get_mut(hunk_index).ok_or_else(|| format!("no hunk at index {hunk_index}"))?;
+    hunk.resolution = Some(merge_core::Resolution::Manual);
+    Ok(())
+}
+
+/// Closes a merge tab, freeing its `MergeTab`. Same no-op-on-unknown-id semantics as `close_tab`.
+#[tauri::command]
+fn close_merge_tab(state: tauri::State<MergeState>, tab_id: String) {
+    state.tabs.lock().unwrap().remove(&tab_id);
+}
+
+fn apply_merge_edit_impl(state: &MergeState, tab_id: &str, from_utf16: u32, to_utf16: u32, inserted: &str) -> Result<(), String> {
+    let mut tabs = state.tabs.lock().unwrap();
+    let tab = tabs.get_mut(tab_id).ok_or("no merge tab open with this id")?;
+    tab.merged.apply_delta(from_utf16, to_utf16, inserted)
+}
+
+/// The merged pane's own edit-delta pipeline, structurally identical to `apply_edit` for M1-M4's
+/// two-way diff panes -- a keystroke in the merged pane (or a resolution-action click's own
+/// programmatic replace, dispatched through the same CM6 transaction path) lands here the same
+/// way. Marking the affected hunk(s) `Manual` is the frontend's job (`mark_merge_hunk_manual`),
+/// called alongside this for a real keystroke, not for a resolution click's own dispatch (which
+/// already set a non-Manual resolution via `resolve_merge_hunk` before dispatching the change).
+#[tauri::command]
+fn apply_merge_edit(state: tauri::State<MergeState>, tab_id: String, from_utf16: u32, to_utf16: u32, inserted: String) -> Result<(), String> {
+    apply_merge_edit_impl(&state, &tab_id, from_utf16, to_utf16, &inserted)
+}
+
+/// Writes the merged buffer's current text back to `path` (LOCAL's original path, per
+/// `git mergetool`'s MERGED-starts-as-LOCAL convention already noted on `open_merge_pair`).
+/// Returns whether every hunk has a resolution other than `None` (i.e. no hunk is still an
+/// unresolved `Conflict`) -- task #42's write-back-with-correct-exit-status needs this to decide
+/// whether the CLI process should exit 0 or non-zero, which `save_merge` itself has no business
+/// deciding (it only knows how to write bytes; the exit-status *policy* belongs at the CLI/vcs
+/// layer, same module-boundary reasoning as everywhere else in this codebase).
+#[tauri::command]
+fn save_merge(state: tauri::State<MergeState>, tab_id: String, path: String) -> Result<bool, String> {
+    let mut tabs = state.tabs.lock().unwrap();
+    let tab = tabs.get_mut(&tab_id).ok_or("no merge tab open with this id")?;
+    let bytes = tab.merged.to_bytes()?;
+    std::fs::write(&path, &bytes).map_err(|e| format!("{path}: {e}"))?;
+    tab.merged.mark_saved(bytes);
+    Ok(tab.hunks.iter().all(|h| h.resolution.is_some()))
+}
+
 /// Companion to `open_file_pair`: the normalized (BOM-stripped, LF-normalized) full text of
 /// one real file, as raw bytes rather than a JSON string (see `fixture_text`'s doc comment —
 /// same IPC-cost rationale applies here). Normalized rather than raw so the line count the
@@ -451,6 +619,60 @@ mod tests {
     }
 
     #[test]
+    fn open_merge_pair_computes_hunks_and_seeds_the_merged_buffer() {
+        let base = b"a\nb\nc\n";
+        let local = b"a\nLOCAL\nc\n";
+        let remote = b"a\nb\nc\n";
+        let (tab, result) = open_merge_pair(base, local, remote, merge_core::TakeBothOrder::LocalFirst).unwrap();
+        assert_eq!(result.hunks.len(), 1);
+        assert_eq!(result.merged_text, "a\nLOCAL\nc\n");
+        assert_eq!(tab.merged.text(), "a\nLOCAL\nc\n");
+        assert!(!tab.merged.is_dirty(), "seeding the merged buffer must not itself count as an edit");
+    }
+
+    #[test]
+    fn open_merge_pair_refuses_when_any_side_is_binary() {
+        let result = open_merge_pair(b"a\n", b"hello\0world", b"a\n", merge_core::TakeBothOrder::LocalFirst);
+        match result {
+            Err(e) => assert!(e.contains("binary"), "expected a binary-file error, got: {e}"),
+            Ok(_) => panic!("expected an error for a binary local file"),
+        }
+    }
+
+    #[test]
+    fn resolve_merge_hunk_updates_resolution_and_returns_the_new_text() {
+        let (mut tab, _) = open_merge_pair(b"a\nb\nc\n", b"a\nLOCAL\nc\n", b"a\nREMOTE\nc\n", merge_core::TakeBothOrder::LocalFirst).unwrap();
+        assert_eq!(tab.hunks[0].resolution, None, "starts as an unresolved conflict");
+        let text = resolve_merge_hunk_impl(&mut tab, 0, merge_core::Resolution::TakeRemote, merge_core::TakeBothOrder::LocalFirst).unwrap();
+        assert_eq!(text, "REMOTE");
+        assert_eq!(tab.hunks[0].resolution, Some(merge_core::Resolution::TakeRemote));
+    }
+
+    #[test]
+    fn resolve_merge_hunk_respects_take_both_order() {
+        let (mut tab, _) = open_merge_pair(b"a\nb\nc\n", b"a\nLOCAL\nc\n", b"a\nREMOTE\nc\n", merge_core::TakeBothOrder::LocalFirst).unwrap();
+        let local_first = resolve_merge_hunk_impl(&mut tab, 0, merge_core::Resolution::TakeBoth, merge_core::TakeBothOrder::LocalFirst).unwrap();
+        assert_eq!(local_first, "LOCAL\nREMOTE");
+        let remote_first = resolve_merge_hunk_impl(&mut tab, 0, merge_core::Resolution::TakeBoth, merge_core::TakeBothOrder::RemoteFirst).unwrap();
+        assert_eq!(remote_first, "REMOTE\nLOCAL");
+    }
+
+    #[test]
+    fn resolve_merge_hunk_errors_on_an_out_of_range_index_instead_of_panicking() {
+        let (mut tab, _) = open_merge_pair(b"a\nb\nc\n", b"a\nLOCAL\nc\n", b"a\nREMOTE\nc\n", merge_core::TakeBothOrder::LocalFirst).unwrap();
+        let result = resolve_merge_hunk_impl(&mut tab, 99, merge_core::Resolution::TakeRemote, merge_core::TakeBothOrder::LocalFirst);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_merge_hunk_rejects_manual_rather_than_forwarding_to_resolve_hunk_text() {
+        let (mut tab, _) = open_merge_pair(b"a\nb\nc\n", b"a\nLOCAL\nc\n", b"a\nREMOTE\nc\n", merge_core::TakeBothOrder::LocalFirst).unwrap();
+        let result = resolve_merge_hunk_impl(&mut tab, 0, merge_core::Resolution::Manual, merge_core::TakeBothOrder::LocalFirst);
+        assert!(result.is_err(), "Manual must go through mark_merge_hunk_manual, not this command");
+        assert_eq!(tab.hunks[0].resolution, None, "a rejected call must not mutate hunk state");
+    }
+
+    #[test]
     fn diffs_across_different_encodings_on_each_side() {
         // right is UTF-16LE with a BOM; text-io must decode both sides before diffing.
         let mut right = vec![0xFF, 0xFE];
@@ -716,11 +938,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(SessionState::default())
         .manage(ScanState::default())
+        .manage(MergeState::default())
         .invoke_handler(tauri::generate_handler![
             diff_fixture, fixture_text, report_ready, report_bench, report_error, bench_flags,
             open_file_pair, open_file_text, launch_args, intra_line_spans, apply_edit, redo_diff,
             save_file, path_kind, scan_dirs, cancel_scan, close_tab, load_settings, save_settings,
-            open_settings_window
+            open_settings_window, open_merge, resolve_merge_hunk, mark_merge_hunk_manual,
+            close_merge_tab, apply_merge_edit, save_merge
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

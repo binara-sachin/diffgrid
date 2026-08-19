@@ -53,6 +53,7 @@ version = "0.1.0"
 dependencies = [
  "diff-core",
  "dirwalk",
+ "merge-core",
  "serde",
  "serde_json",
  "session",
