@@ -1,0 +1,11 @@
+[package]
+name = "merge-core"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+diff-core = { path = "../diff-core" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

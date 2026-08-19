@@ -649,3 +649,49 @@ advisor review." That's false — no advisor call actually happened at that poin
 the bug was caught by re-reading the sidebar count logic during self-review, not by the advisor
 tool. Recorded here rather than silently edited, per this file's own convention (see the M3
 "sorted" correction above) for surfacing a gap-then-fix rather than hiding it.
+
+## 2026-08-19 — M5's `merge-core`: diff3-style clustering over base-line coordinates, not two independently-reconciled hunk lists
+
+**Decision**: `crates/merge-core::compute_merge_hunks` reuses `diff_core::diff_lines` twice
+(base→local, base→remote), tags every non-`Equal` hunk from both results with its side, sorts by
+base-line position, then clusters hunks whose base-line ranges overlap (or are the same
+zero-length insertion point) into one `MergeHunk`. A cluster touched by only one side auto-merges
+to that side; a cluster touched by both sides auto-merges if the resolved local/remote text is
+byte-identical, otherwise conflicts.
+
+**Why this shape and not the two-crates-considered alternatives**: (1) a Rust diff3/merge crate
+already exists (`threeway_merge`) but statically links libgit2/xdiff under LGPL-2.1 — a licensing
+complication not worth taking on when `imara-diff`'s histogram algorithm (Apache/MIT, already the
+diff engine for M1-M4) can be reused directly. (2) The naive alternative — diff base-vs-local and
+base-vs-remote into two separate `Vec<Hunk>` and try to reconcile their non-corresponding
+boundaries after the fact — was flagged before implementation as significantly harder to get
+right than clustering directly over shared base-line coordinates (base lines are the join key
+both diffs already share, the same role `DirEntry.path` played reconciling two directory scans in
+M3's `dirwalk`). Went with the coordinate-clustering approach from the start.
+
+**Verified, not just written**: TDD throughout (9 tests written before their implementation,
+each watched RED for the right reason before going GREEN), plus mutation testing on both the
+`overlaps` interval check and the identical-vs-conflict text comparison (flipping `<` to `<=`,
+and short-circuiting the equality check to always-conflict) — both mutations were caught by
+existing tests, not silently passed. The specific case this design exists to get right —
+identical changes on the same base lines merging cleanly instead of false-conflicting, which a
+naive "did both sides touch this hunk → conflict" rule would get wrong — has its own test
+(`identical_changes_on_the_same_base_lines_merge_cleanly_as_one_hunk_not_a_conflict`) and passed
+on the first real implementation attempt, not after a red herring.
+
+**A real process lapse worth recording**: the first version of this crate was written
+implementation-and-tests together in one shot, not test-first — a direct violation of this
+project's own established TDD discipline. Caught via self-review before committing, not shipped;
+the whole crate was deleted (`rm -rf crates/merge-core`, `git checkout -- Cargo.toml`) and rebuilt
+from an empty file, one RED/GREEN cycle at a time, per the paragraph above. Recorded here as a
+concrete instance of "process shortcuts under a big task compound," not smoothed over.
+
+**How to apply**: `build_merged_text(base, local, remote, merge_hunks)` walks the same hunk list
+in base order and is intentionally decoupled from `compute_merge_hunks` — any code driving a
+resolution UI can freely overwrite a `MergeHunk`'s `resolution` field (e.g. changing an
+auto-merged hunk's default `TakeLocal` to `TakeBoth`, or resolving a `Conflict` hunk by hand)
+before calling `build_merged_text`, without needing to re-run classification. An unresolved
+`Conflict` hunk (`resolution: None`) currently renders as base content in the merged output --
+this is a placeholder, not a design decision about what "unresolved" should look like in the
+finished UI; task #40/#41 need to make sure the UI never lets a save happen while any hunk still
+has `resolution: None` without the user being clearly told a conflict is unresolved.
