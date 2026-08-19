@@ -67,10 +67,13 @@ export interface ScanOutcome {
 }
 
 export type IntraLineMode = "off" | "word" | "character";
+export type TakeBothSide = "mineFirst" | "theirsFirst";
 
 export interface Settings {
   ignoreWhitespace: boolean;
   ignoreCase: boolean;
   collapseContextLines: number;
   intraLineMode: IntraLineMode;
+  autoResolveNonConflicting: boolean;
+  defaultTakeBothSide: TakeBothSide;
 }
