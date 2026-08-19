@@ -198,3 +198,13 @@ by construction (window creation and app-wide events are core Tauri, not a rende
 per this document's own standing caveat about everything only having run under WebKitGTK/Xvfb so
 far, a real macOS spot-check (open Settings, toggle a value, confirm the main window's next-opened
 tab picks it up) is still worth doing before fully trusting it there.
+
+**Multi-tab edit/save isolation (the core M4 `HashMap<TabId, TabBuffers>` refactor) was verified
+end-to-end under Xvfb, not just at the Rust unit-test level.** Opened two file-pair tabs from a
+directory scan, edited only the second tab's left pane, and confirmed: the first tab's pane still
+showed its original unedited content with "Save left" correctly disabled when switched back to;
+saving the second tab wrote only that tab's file to disk (verified by reading both files after);
+and the dirty-guard `window.confirm()` on closing an edited tab rendered as a real, legible native
+dialog under this GPU-less sandbox (unlike the earlier WebKitGTK `title`-tooltip finding above) —
+clicking Cancel correctly kept the tab open with its edit intact. No `report_error` calls appeared
+in the process log across the whole sequence.

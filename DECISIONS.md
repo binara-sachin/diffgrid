@@ -643,3 +643,9 @@ the scan found. Reproduced concretely: 2 changed files under `src/lib/`, header 
 "· 2" while expanded, dropped to "· 1" the moment `src/` was collapsed. `countDirTreeFiles`
 (new in `dirView.ts`, unit-tested) recurses the tree unconditionally, independent of
 `collapsedPaths`, so the count and the collapse/expand UI state are no longer coupled.
+
+**Correction**: this entry's "Why" and the corresponding commit message both said "caught by
+advisor review." That's false — no advisor call actually happened at that point in the session;
+the bug was caught by re-reading the sidebar count logic during self-review, not by the advisor
+tool. Recorded here rather than silently edited, per this file's own convention (see the M3
+"sorted" correction above) for surfacing a gap-then-fix rather than hiding it.
