@@ -1,7 +1,9 @@
-import { RangeSetBuilder, StateEffect, StateField, Text } from "@codemirror/state";
-import { Decoration, type DecorationSet, EditorView } from "@codemirror/view";
+import { EditorState, RangeSetBuilder, StateEffect, StateField, Text } from "@codemirror/state";
+import { Decoration, type DecorationSet, EditorView, type ViewUpdate, lineNumbers, keymap } from "@codemirror/view";
+import { defaultKeymap } from "@codemirror/commands";
+import { javascript } from "@codemirror/lang-javascript";
 import type { LineRange, MergeHunk, TakeBothSide } from "./types";
-import { posAfterLine } from "./diffView";
+import { LINE_HEIGHT_PX, type EditDelta, editDeltasFromUpdate, posAfterLine } from "./diffView";
 
 function extractLines(text: string, range: LineRange): string {
   const lines = text.split("\n");
@@ -101,6 +103,32 @@ export function buildMergeHunkDecorations(doc: Text, ranges: LineRange[], hunks:
   return builder.finish();
 }
 
+/**
+ * One `Decoration.mark` per hunk on a read-only source pane (base/local/remote), using that
+ * hunk's `LineRange` for `side` -- unlike `buildMergeHunkDecorations`, this needs no live
+ * position tracking (base/local/remote are read-only and never edited after open, so their line
+ * ranges never drift), but shares the exact same `HUNK_INDEX_ATTR` convention and `hunkIndexAtPos`
+ * lookup so a click on any of the four panes resolves to a hunk index the same way.
+ */
+export function buildSourcePaneDecorations(doc: Text, hunks: MergeHunk[], side: "base" | "local" | "remote"): DecorationSet {
+  const builder = new RangeSetBuilder<Decoration>();
+  const entries = hunks.map((h, i) => ({ range: h[side], hunk: h, i })).sort((a, b) => a.range.start - b.range.start);
+  for (const { range, hunk, i } of entries) {
+    if (range.len === 0) continue;
+    const from = posAfterLine(doc, range.start);
+    const to = posAfterLine(doc, range.start + range.len);
+    builder.add(
+      from,
+      to,
+      Decoration.mark({
+        class: `merge-hunk merge-hunk-${hunk.kind}`,
+        attributes: { [HUNK_INDEX_ATTR]: String(i) },
+      }),
+    );
+  }
+  return builder.finish();
+}
+
 /** Finds which hunk (by index into the original `hunks` array `buildMergeHunkDecorations` was
  * called with) covers `pos` in the live document, or `null` if none does -- e.g. a click in the
  * merged pane lands here to find which hunk's resolution-action buttons should be shown/enabled
@@ -132,3 +160,52 @@ export const mergeHunkDecorationsField = StateField.define<DecorationSet>({
   },
   provide: (field) => EditorView.decorations.from(field),
 });
+
+function mergeTheme() {
+  return EditorView.theme({
+    "&": { height: "100%", fontSize: "13px" },
+    ".cm-scroller": { overflow: "auto", fontFamily: "ui-monospace, Menlo, monospace" },
+    ".cm-line": { lineHeight: `${LINE_HEIGHT_PX}px` },
+  });
+}
+
+/** A read-only base/local/remote pane -- no editing, no padding/alignment (each of the three
+ * source panes has its own independent line numbering; there's no cross-pane alignment
+ * requirement for them the way M1-M4's two-way diff view has). */
+export function createMergeSourceEditor(parent: HTMLElement, text: string, hunks: MergeHunk[], side: "base" | "local" | "remote"): EditorView {
+  const doc = Text.of(text.split("\n"));
+  const state = EditorState.create({
+    doc,
+    extensions: [
+      lineNumbers(),
+      EditorState.readOnly.of(true),
+      mergeHunkDecorationsField.init(() => buildSourcePaneDecorations(doc, hunks, side)),
+      mergeTheme(),
+    ],
+  });
+  return new EditorView({ state, parent });
+}
+
+/** The editable merged-output pane, seeded from `OpenMergeResult.mergedText`. `onEdit` fires for
+ * every real keystroke or programmatic replace (a resolution-action click's own dispatch) alike
+ * -- the caller is responsible for calling `mark_merge_hunk_manual` only for the former, since a
+ * resolution click already sets a non-Manual resolution via `resolve_merge_hunk` before
+ * dispatching its own change. */
+export function createMergedEditor(parent: HTMLElement, mergedText: string, initialDecorations: DecorationSet, onEdit: (deltas: EditDelta[]) => void): EditorView {
+  const doc = Text.of(mergedText.split("\n"));
+  const state = EditorState.create({
+    doc,
+    extensions: [
+      lineNumbers(),
+      keymap.of(defaultKeymap),
+      javascript(),
+      mergeHunkDecorationsField.init(() => initialDecorations),
+      EditorView.updateListener.of((update: ViewUpdate) => {
+        if (!update.docChanged) return;
+        onEdit(editDeltasFromUpdate(update));
+      }),
+      mergeTheme(),
+    ],
+  });
+  return new EditorView({ state, parent });
+}

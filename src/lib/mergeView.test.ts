@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { Text } from "@codemirror/state";
 import { EditorState } from "@codemirror/state";
-import { buildMergeHunkDecorations, hunkIndexAtPos, initialMergedHunkRanges, mergeHunkDecorationsField, resolveHunkText, setMergeHunkDecorations } from "./mergeView";
+import {
+  buildMergeHunkDecorations,
+  buildSourcePaneDecorations,
+  hunkIndexAtPos,
+  initialMergedHunkRanges,
+  mergeHunkDecorationsField,
+  resolveHunkText,
+  setMergeHunkDecorations,
+} from "./mergeView";
 import { posAfterLine } from "./diffView";
 import type { MergeHunk } from "./types";
 
@@ -90,6 +98,30 @@ describe("initialMergedHunkRanges", () => {
     const mergedLines = mergedText.split("\n");
     expect(mergedLines.slice(ranges[0].start, ranges[0].start + ranges[0].len).join("\n")).toBe("LOCAL1\nLOCAL2");
     expect(mergedLines.slice(ranges[1].start, ranges[1].start + ranges[1].len).join("\n")).toBe("REMOTE");
+  });
+});
+
+describe("buildSourcePaneDecorations", () => {
+  it("marks each hunk's range on the given side using that side's own LineRange", () => {
+    const doc = Text.of("a\nLOCAL\nc\n".split("\n"));
+    const hunks: MergeHunk[] = [hunk({ local: { start: 1, len: 1 }, kind: "autoMerged", resolution: "takeLocal" })];
+    const decorations = buildSourcePaneDecorations(doc, hunks, "local");
+    const found = hunkIndexAtPos(decorations, posAfterLine(doc, 1));
+    expect(found).toBe(0);
+  });
+
+  it("uses the base LineRange for the base pane, not local/remote", () => {
+    const doc = Text.of("a\nb\nc\n".split("\n"));
+    const hunks: MergeHunk[] = [hunk({ base: { start: 1, len: 1 }, local: { start: 1, len: 5 }, kind: "conflict", resolution: null })];
+    const decorations = buildSourcePaneDecorations(doc, hunks, "base");
+    expect(hunkIndexAtPos(decorations, posAfterLine(doc, 1))).toBe(0);
+  });
+
+  it("skips a zero-length range for this side (e.g. a pure insertion has no base lines)", () => {
+    const doc = Text.of("a\nb\n".split("\n"));
+    const hunks: MergeHunk[] = [hunk({ base: { start: 1, len: 0 }, local: { start: 1, len: 1 }, resolution: "takeLocal" })];
+    const decorations = buildSourcePaneDecorations(doc, hunks, "base");
+    expect(hunkIndexAtPos(decorations, posAfterLine(doc, 1))).toBeNull();
   });
 });
 
