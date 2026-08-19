@@ -139,15 +139,37 @@ pub fn compute_merge_hunks(base: &str, local: &str, remote: &str) -> Vec<MergeHu
     merge_hunks
 }
 
-/// Builds the merged output text by walking `merge_hunks` in base order, taking the untouched
-/// base content between hunks verbatim and, for each hunk, the content dictated by its
+/// Which side's content comes first when a hunk resolves to `Resolution::TakeBoth` -- the
+/// merge-core equivalent of `session::TakeBothSide` (docs/UI/ui-02.png's "Default side when
+/// taking both"). Kept as its own type here rather than depending on the `session` crate: no
+/// other crate in this workspace depends on `session`, and this crate's own dependency (only
+/// `diff-core`) should stay that way -- the `app` crate is what translates `session::TakeBothSide`
+/// into this at the call site, the same pattern it already uses for `session::IntraLineMode` ->
+/// `diff_core`'s word/character mode functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakeBothOrder {
+    LocalFirst,
+    RemoteFirst,
+}
+
+/// Builds the *initial* merged output text by walking `merge_hunks` in base order, taking the
+/// untouched base content between hunks verbatim and, for each hunk, the content dictated by its
 /// `resolution` (an unresolved `Conflict` hunk -- `resolution: None` -- takes the base's own
 /// content for that region as a placeholder; the frontend is responsible for surfacing that it's
 /// still unresolved before write-back, per docs/PLAN.md's write-back-with-correct-exit-status
 /// requirement). `merge_hunks` must be the exact list `compute_merge_hunks` returned for this
 /// same `(base, local, remote)` triple -- the `local`/`remote`/`base` LineRanges only make sense
 /// against those specific texts.
-pub fn build_merged_text(base: &str, local: &str, remote: &str, merge_hunks: &[MergeHunk]) -> String {
+///
+/// This seeds the merged-pane CM6 buffer once, at merge-view open (same role `open_file_pair`
+/// plays for M1/M2's two-pane view) -- it is NOT re-invoked on every resolution change. Once the
+/// merged pane exists, CM6's document is authoritative for it (same principle as M2's `EditBuffer`
+/// for a two-way diff): the frontend edits the merged text directly for a given hunk (marking its
+/// `resolution` as `Manual`) or replaces just that hunk's range in the live buffer for a
+/// TakeLocal/TakeRemote/TakeBoth/TakeBase click, rather than re-deriving the whole document from
+/// scratch. Calling this function again after any hunk has gone `Manual` is therefore a caller
+/// bug, not a supported "recompute" path -- see the `Manual` match arm's panic below.
+pub fn build_merged_text(base: &str, local: &str, remote: &str, merge_hunks: &[MergeHunk], take_both_order: TakeBothOrder) -> String {
     let base_lines: Vec<&str> = base.split('\n').collect();
     let mut out_lines: Vec<String> = Vec::new();
     let mut base_cursor = 0u32;
@@ -160,12 +182,20 @@ pub fn build_merged_text(base: &str, local: &str, remote: &str, merge_hunks: &[M
             Some(Resolution::TakeLocal) => extract_lines(local, h.local),
             Some(Resolution::TakeRemote) => extract_lines(remote, h.remote),
             Some(Resolution::TakeBoth) => {
-                let a = extract_lines(local, h.local);
-                let b = extract_lines(remote, h.remote);
-                if a.is_empty() { b } else if b.is_empty() { a } else { format!("{a}\n{b}") }
+                let local_text = extract_lines(local, h.local);
+                let remote_text = extract_lines(remote, h.remote);
+                let (first, second) = match take_both_order {
+                    TakeBothOrder::LocalFirst => (local_text, remote_text),
+                    TakeBothOrder::RemoteFirst => (remote_text, local_text),
+                };
+                if first.is_empty() { second } else if second.is_empty() { first } else { format!("{first}\n{second}") }
             }
             Some(Resolution::TakeBase) | None => extract_lines(base, h.base),
-            Some(Resolution::Manual) => extract_lines(base, h.base),
+            Some(Resolution::Manual) => panic!(
+                "Manual resolution has no derivable text from base/local/remote LineRanges -- \
+                 the merged-pane CM6 buffer is authoritative once a hunk is Manual, so \
+                 build_merged_text must not be called again for it"
+            ),
         };
         if !resolved.is_empty() {
             out_lines.extend(resolved.split('\n').map(|s| s.to_string()));
@@ -285,7 +315,7 @@ mod tests {
     fn build_merged_text_with_no_hunks_returns_base_unchanged() {
         let base = "a\nb\nc\n";
         let hunks = compute_merge_hunks(base, base, base);
-        let merged = build_merged_text(base, base, base, &hunks);
+        let merged = build_merged_text(base, base, base, &hunks, TakeBothOrder::LocalFirst);
         assert_eq!(merged, base);
     }
 
@@ -294,7 +324,7 @@ mod tests {
         let base = "a\nb\nc\n";
         let local = "a\nLOCAL\nc\n";
         let hunks = compute_merge_hunks(base, local, base);
-        let merged = build_merged_text(base, local, base, &hunks);
+        let merged = build_merged_text(base, local, base, &hunks, TakeBothOrder::LocalFirst);
         assert_eq!(merged, "a\nLOCAL\nc\n");
     }
 
@@ -304,7 +334,7 @@ mod tests {
         let local = "1\nLOCAL\n3\n4\n5\n";
         let remote = "1\n2\n3\n4\nREMOTE\n";
         let hunks = compute_merge_hunks(base, local, remote);
-        let merged = build_merged_text(base, local, remote, &hunks);
+        let merged = build_merged_text(base, local, remote, &hunks, TakeBothOrder::LocalFirst);
         assert_eq!(merged, "1\nLOCAL\n3\n4\nREMOTE\n");
     }
 
@@ -316,7 +346,7 @@ mod tests {
         let mut hunks = compute_merge_hunks(base, local, remote);
         assert_eq!(hunks[0].kind, MergeHunkKind::Conflict);
         hunks[0].resolution = Some(Resolution::TakeRemote);
-        let merged = build_merged_text(base, local, remote, &hunks);
+        let merged = build_merged_text(base, local, remote, &hunks, TakeBothOrder::LocalFirst);
         assert_eq!(merged, "a\nREMOTE\nc\n");
     }
 
@@ -327,8 +357,35 @@ mod tests {
         let remote = "a\nREMOTE\nc\n";
         let mut hunks = compute_merge_hunks(base, local, remote);
         hunks[0].resolution = Some(Resolution::TakeBoth);
-        let merged = build_merged_text(base, local, remote, &hunks);
+        let merged = build_merged_text(base, local, remote, &hunks, TakeBothOrder::LocalFirst);
         assert_eq!(merged, "a\nLOCAL\nREMOTE\nc\n");
+    }
+
+    #[test]
+    fn build_merged_text_take_both_respects_remote_first_order() {
+        let base = "a\nb\nc\n";
+        let local = "a\nLOCAL\nc\n";
+        let remote = "a\nREMOTE\nc\n";
+        let mut hunks = compute_merge_hunks(base, local, remote);
+        hunks[0].resolution = Some(Resolution::TakeBoth);
+        let merged = build_merged_text(base, local, remote, &hunks, TakeBothOrder::RemoteFirst);
+        assert_eq!(merged, "a\nREMOTE\nLOCAL\nc\n");
+    }
+
+    #[test]
+    #[should_panic(expected = "Manual")]
+    fn build_merged_text_panics_on_a_manual_resolution() {
+        // Manual means the user has directly edited that hunk's content in the merged-pane CM6
+        // buffer, which is authoritative from that point on (same pattern as M2's EditBuffer) --
+        // there is no derivable text for this hunk from base/local/remote LineRanges alone, so
+        // calling build_merged_text again after a Manual resolution is a caller bug, not a case
+        // to silently paper over with base content.
+        let base = "a\nb\nc\n";
+        let local = "a\nLOCAL\nc\n";
+        let remote = "a\nREMOTE\nc\n";
+        let mut hunks = compute_merge_hunks(base, local, remote);
+        hunks[0].resolution = Some(Resolution::Manual);
+        build_merged_text(base, local, remote, &hunks, TakeBothOrder::LocalFirst);
     }
 
     #[test]
@@ -338,7 +395,7 @@ mod tests {
         let remote = "a\nREMOTE\nc\n";
         let mut hunks = compute_merge_hunks(base, local, remote);
         hunks[0].resolution = Some(Resolution::TakeBase);
-        let merged = build_merged_text(base, local, remote, &hunks);
+        let merged = build_merged_text(base, local, remote, &hunks, TakeBothOrder::LocalFirst);
         assert_eq!(merged, base);
     }
 }

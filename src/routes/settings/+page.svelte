@@ -1,14 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import type { IntraLineMode, Settings } from "$lib/types";
+  import type { IntraLineMode, Settings, TakeBothSide } from "$lib/types";
 
-  // M4's settings window (docs/UI/ui-02.png). Scoped to just the "Diff & merge > Comparison"
-  // group, the only settings this app actually implements -- see DECISIONS.md for why the
-  // mockup's other nav categories (General/Editor/Filters/Version control/Shortcuts) and the
-  // Merge section aren't built here: there's no content to put in them yet, and empty
-  // placeholder scaffolding isn't worth the code.
-  let settings: Settings = $state({ ignoreWhitespace: false, ignoreCase: false, collapseContextLines: 3, intraLineMode: "character" });
+  // M4's settings window (docs/UI/ui-02.png). Scoped to the "Diff & merge > Comparison" and
+  // "Merge" groups, the only settings this app actually implements -- see DECISIONS.md for why
+  // the mockup's other nav categories (General/Editor/Filters/Version control/Shortcuts) aren't
+  // built here: there's no content to put in them yet, and empty placeholder scaffolding isn't
+  // worth the code.
+  let settings: Settings = $state({ ignoreWhitespace: false, ignoreCase: false, collapseContextLines: 3, intraLineMode: "character", autoResolveNonConflicting: true, defaultTakeBothSide: "mineFirst" });
   let loaded = $state(false);
 
   onMount(async () => {
@@ -37,6 +37,11 @@
   ];
 
   const contextLineOptions = [0, 1, 3, 5, 10, 20];
+
+  const takeBothSides: { value: TakeBothSide; label: string }[] = [
+    { value: "mineFirst", label: "Mine first" },
+    { value: "theirsFirst", label: "Theirs first" },
+  ];
 </script>
 
 <main>
@@ -81,6 +86,29 @@
       {/each}
     </div>
   </div>
+
+  <h1 class="section-gap">Merge</h1>
+
+  <div class="row">
+    <div class="row-text">
+      <div class="row-title">Auto-resolve non-conflicting chunks</div>
+      <div class="row-desc">Only stop where both sides touched the same lines</div>
+    </div>
+    <input type="checkbox" bind:checked={settings.autoResolveNonConflicting} onchange={persist} />
+  </div>
+
+  <div class="row">
+    <div class="row-text">
+      <div class="row-title">Default side when taking both</div>
+    </div>
+    <div class="segmented">
+      {#each takeBothSides as s (s.value)}
+        <button class:active={settings.defaultTakeBothSide === s.value} onclick={() => { settings.defaultTakeBothSide = s.value; persist(); }}>
+          {s.label}
+        </button>
+      {/each}
+    </div>
+  </div>
 </main>
 
 <style>
@@ -88,6 +116,7 @@
   :global(body) {
     margin: 0;
     height: 100%;
+    overflow-y: auto;
   }
   main {
     font-family: -apple-system, ui-sans-serif, system-ui, sans-serif;
@@ -101,6 +130,9 @@
     text-transform: uppercase;
     color: #888;
     margin: 0 0 12px 0;
+  }
+  h1.section-gap {
+    margin-top: 28px;
   }
   .row {
     display: flex;

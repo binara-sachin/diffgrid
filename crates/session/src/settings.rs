@@ -16,6 +16,17 @@ pub enum IntraLineMode {
     Character,
 }
 
+/// M5's "Default side when taking both" (docs/UI/ui-02.png's MERGE group) -- which side's content
+/// comes first when a conflict hunk is resolved via `Resolution::TakeBoth` in `merge-core`. This
+/// is a real merge-core input, not presentation: it decides the actual byte order of the merged
+/// output, so it's threaded through to the `TakeBoth` resolution call, not just displayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TakeBothSide {
+    MineFirst,
+    TheirsFirst,
+}
+
 /// Global preferences, per docs/PLAN.md §5 ("resolved settings (global + per-session override)").
 /// This struct *is* the global half; the per-session override for `ignore_whitespace`/
 /// `ignore_case` lives in the frontend's per-tab state (see `+page.svelte`'s `FileTab`), seeded
@@ -30,11 +41,24 @@ pub struct Settings {
     pub ignore_case: bool,
     pub collapse_context_lines: u32,
     pub intra_line_mode: IntraLineMode,
+    /// Presentation-only, per DECISIONS.md: merge-core always classifies AutoMerged/Conflict
+    /// honestly regardless of this toggle. It only controls whether the merge view surfaces
+    /// AutoMerged hunks to the user as reviewable rows or hides them (auto-applies them
+    /// silently), matching the mockup's "Only stop where both sides touched the same lines."
+    pub auto_resolve_non_conflicting: bool,
+    pub default_take_both_side: TakeBothSide,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { ignore_whitespace: false, ignore_case: false, collapse_context_lines: 3, intra_line_mode: IntraLineMode::Character }
+        Self {
+            ignore_whitespace: false,
+            ignore_case: false,
+            collapse_context_lines: 3,
+            intra_line_mode: IntraLineMode::Character,
+            auto_resolve_non_conflicting: true,
+            default_take_both_side: TakeBothSide::MineFirst,
+        }
     }
 }
 
@@ -77,6 +101,19 @@ mod tests {
     }
 
     #[test]
+    fn merge_defaults_match_ui_02_mockup() {
+        let s = Settings::default();
+        assert!(s.auto_resolve_non_conflicting, "mockup shows this toggle on by default");
+        assert_eq!(s.default_take_both_side, TakeBothSide::MineFirst, "mockup shows \"Mine first\" selected by default");
+    }
+
+    #[test]
+    fn take_both_side_serializes_as_lowercase_camel_case_variants() {
+        assert_eq!(serde_json::to_value(TakeBothSide::MineFirst).unwrap(), "mineFirst");
+        assert_eq!(serde_json::to_value(TakeBothSide::TheirsFirst).unwrap(), "theirsFirst");
+    }
+
+    #[test]
     fn settings_serialize_with_camel_case_field_names() {
         let json = serde_json::to_value(Settings::default()).unwrap();
         assert!(json.get("ignoreWhitespace").is_some());
@@ -109,7 +146,14 @@ mod tests {
     #[test]
     fn save_then_load_round_trips_exactly() {
         let dir = temp_dir("round-trip");
-        let settings = Settings { ignore_whitespace: true, ignore_case: true, collapse_context_lines: 5, intra_line_mode: IntraLineMode::Word };
+        let settings = Settings {
+            ignore_whitespace: true,
+            ignore_case: true,
+            collapse_context_lines: 5,
+            intra_line_mode: IntraLineMode::Word,
+            auto_resolve_non_conflicting: false,
+            default_take_both_side: TakeBothSide::TheirsFirst,
+        };
         save_settings(&dir, &settings).unwrap();
         assert_eq!(load_settings(&dir), settings);
         std::fs::remove_dir_all(&dir).ok();

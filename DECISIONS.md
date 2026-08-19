@@ -695,3 +695,38 @@ before calling `build_merged_text`, without needing to re-run classification. An
 this is a placeholder, not a design decision about what "unresolved" should look like in the
 finished UI; task #40/#41 need to make sure the UI never lets a save happen while any hunk still
 has `resolution: None` without the user being clearly told a conflict is unresolved.
+
+## 2026-08-19 — M5 merge settings: `TakeBothOrder` stays in `merge-core`, `session::TakeBothSide` is the persisted setting
+
+**Decision**: `crates/merge-core` gained its own minimal `TakeBothOrder` enum (`LocalFirst`/
+`RemoteFirst`) as a parameter to `build_merged_text`, rather than depending on `session` for
+`TakeBothSide`. `session::Settings` gained `auto_resolve_non_conflicting: bool` and
+`default_take_both_side: TakeBothSide`, matching `docs/UI/ui-02.png`'s MERGE group exactly
+("Auto-resolve non-conflicting chunks" toggle, "Default side when taking both" mine-first/
+theirs-first control).
+
+**Why the split**: no crate in this workspace currently depends on `session` (it's a leaf that
+only depends on `text-io`) — making the pure-algorithm `merge-core` crate depend on `session`
+for one enum would be a real, avoidable coupling in the wrong direction. The `app` crate is
+already the place that translates a `session` setting into a `diff_core`/`merge-core` call
+(see the existing `session::IntraLineMode` -> `diff_core::intra_line_spans_word_mode`/
+`intra_line_spans_with_options` dispatch in `intra_line_spans`); `session::TakeBothSide` ->
+`merge_core::TakeBothOrder` will follow the identical pattern once the Tauri merge commands are
+wired up (task #41/#42).
+
+**`auto_resolve_non_conflicting` is presentation-only, not a merge-core input**: `merge-core`'s
+`compute_merge_hunks` always classifies `AutoMerged` vs `Conflict` honestly regardless of this
+setting -- it only controls whether the merge view surfaces an `AutoMerged` hunk to the user as
+a reviewable row, or applies it silently and shows only real conflicts. This mirrors the mockup's
+own description ("Only stop where both sides touched the same lines") and keeps the actual merge
+classification logic free of a UI-presentation concern.
+
+**`Resolution::Manual` cannot be reconstructed by `build_merged_text`**: fixed a real gap found
+while wiring this up -- the first draft of `build_merged_text` fell through `Manual` to base
+content, silently discarding a user's direct edit to a hunk if the function were ever called
+again. `build_merged_text` is only meant to seed the merged-pane CM6 buffer once at merge-view
+open (the M5 equivalent of `open_file_pair` seeding M1/M2's panes) -- once a hunk goes `Manual`,
+the live CM6 buffer is authoritative for it, same principle as M2's `EditBuffer`. Changed the
+`Manual` match arm to panic with an explanatory message rather than silently producing wrong
+output, and added a test (`build_merged_text_panics_on_a_manual_resolution`) asserting that
+contract explicitly rather than leaving it undocumented.

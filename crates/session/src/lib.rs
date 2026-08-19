@@ -2,7 +2,7 @@ use ropey::Rope;
 use text_io::FileMeta;
 
 mod settings;
-pub use settings::{load_settings, save_settings, IntraLineMode, Settings};
+pub use settings::{load_settings, save_settings, IntraLineMode, Settings, TakeBothSide};
 
 /// One side of an open file pair, per docs/PLAN.md §2 and §5. CM6's document is authoritative
 /// for editing; this is the Rust-side shadow buffer, kept in sync via incremental deltas

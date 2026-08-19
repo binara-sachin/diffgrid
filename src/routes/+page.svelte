@@ -47,7 +47,7 @@
   // here are only ever *defaults* for a newly-opened tab (see newFileTab) -- each tab's own
   // toolbar checkboxes are the per-tab override PLAN.md describes, and never write back here.
   // collapseContextLines/intraLineMode have no per-tab override; they apply uniformly.
-  let settings: Settings = $state({ ignoreWhitespace: false, ignoreCase: false, collapseContextLines: 3, intraLineMode: "character" });
+  let settings: Settings = $state({ ignoreWhitespace: false, ignoreCase: false, collapseContextLines: 3, intraLineMode: "character", autoResolveNonConflicting: true, defaultTakeBothSide: "mineFirst" });
 
   // Which kind of root this session was opened on -- determines whether the sidebar shows.
   // `null` until launch args are resolved in onMount.

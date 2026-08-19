@@ -325,7 +325,7 @@ fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
     }
     WebviewWindowBuilder::new(&app, "settings", WebviewUrl::App("settings".into()))
         .title("Settings")
-        .inner_size(560.0, 420.0)
+        .inner_size(560.0, 560.0)
         .build()
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -611,8 +611,14 @@ mod tests {
     #[test]
     fn settings_wiring_round_trips_through_this_crate_the_same_way_session_does() {
         let dir = std::env::temp_dir().join(format!("diffgrid-test-{}-app-settings", std::process::id()));
-        let settings =
-            session::Settings { ignore_whitespace: true, ignore_case: false, collapse_context_lines: 5, intra_line_mode: session::IntraLineMode::Word };
+        let settings = session::Settings {
+            ignore_whitespace: true,
+            ignore_case: false,
+            collapse_context_lines: 5,
+            intra_line_mode: session::IntraLineMode::Word,
+            auto_resolve_non_conflicting: false,
+            default_take_both_side: session::TakeBothSide::TheirsFirst,
+        };
         save_settings_impl(&dir, &settings).unwrap();
         assert_eq!(load_settings_impl(&dir), settings);
         std::fs::remove_dir_all(&dir).ok();
