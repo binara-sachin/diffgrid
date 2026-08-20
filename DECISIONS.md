@@ -965,3 +965,40 @@ tool-mode invocations (bare file args, `--merge`, anything git spawns) from sing
 entirely, or make the forwarding process block on the real window's close event and forward its
 actual exit code -- never let a second `git mergetool`/`difftool` invocation silently forward-and-
 exit-0 without a window ever opening for it.
+
+## 2026-08-20 — M6: all five difftool/mergetool "edge cases" already work, zero new code
+
+**Decision**: PLAN.md's M6 entry lists "`difftool`/`mergetool` argument-convention edge cases" as
+work to do. Rather than assume any of these needed implementation, checked each one empirically
+(real repo, real conflict/diff scenario, real `git difftool`/`mergetool` invocation under Xvfb) --
+all five already work correctly, with zero diffgrid code changes:
+
+1. **Multi-file `git difftool`**: git's own `GIT_EXTERNAL_DIFF` machinery invokes the configured
+   tool once per changed file, sequentially, waiting for each to exit before moving to the next --
+   confirmed the first invocation receives correct per-file paths (`$LOCAL`/`$REMOTE`); the
+   sequencing itself is git's own well-tested mechanism, not something diffgrid's code influences.
+2. **`git difftool --dir-diff`**: git copies both trees into two temp directories and invokes the
+   tool *once* with two directory paths -- this is exactly M3's existing `diffgrid DIR1 DIR2`
+   entry point. Verified live: opens the real directory-compare view, correctly detects both
+   changed files ("CHANGED FILES · 2").
+3. **A renamed+modified file in a merge conflict**: git's rename detection resolves the rename
+   *before* invoking the mergetool -- diffgrid receives an ordinary `$BASE $LOCAL $REMOTE $MERGED`
+   invocation with real file content, identical to a same-path conflict. Verified live: correctly
+   auto-merged two non-overlapping single-line changes (one from each side) and staged the result
+   with git recording `renamed: original.txt -> renamed.txt`.
+4. **A file deleted on one side (modify/delete conflict)**: bypasses the external mergetool
+   *entirely* -- git's own `resolve_deleted_merge` prompts interactively ("Use (m)odified or
+   (d)eleted file, or (a)bort?") without ever spawning diffgrid. Confirmed via `ps` showing no
+   `app` process during the prompt.
+5. **A symlink conflict** (both a symlink-vs-regular-file "distinct types" conflict and a
+   symlink-vs-symlink target conflict): also bypasses the external tool entirely, via git's own
+   `resolve_symlink_merge` prompt ("Use (l)ocal or (r)emote, or (a)bort?"). Same confirmation
+   method.
+
+**How to apply**: this M6 line item needed investigation and documentation, not implementation --
+verify before assuming a milestone-doc line item is unstarted work; see the difftool finding
+above and the M5 exit-status entry for the same lesson in different forms this session.
+`docs/PLAN.md`'s own listed edge cases are now all accounted for; if a future edge case is
+reported (e.g. a specific `.gitattributes` diff driver interaction, or `--extcmd`), verify it the
+same way -- real repo, real git invocation, `ps`/screenshot/exit-code as ground truth -- before
+writing any code for it.
