@@ -143,6 +143,66 @@ export function hunkIndexAtPos(decorations: DecorationSet, pos: number): number 
   return found;
 }
 
+/** Finds a hunk's current `{from, to}` character range by index (the reverse lookup of
+ * `hunkIndexAtPos`) -- what a resolution-action click needs to know exactly which range in the
+ * live merged document to replace. Returns `null` if that hunk has no decoration (a zero-length
+ * hunk was never added by `buildMergeHunkDecorations`, so there's nothing to replace -- the
+ * caller should insert at a computed position instead, not treat this as an error). Iterates
+ * the whole set rather than a targeted lookup since `RangeSet` has no direct "get by attribute"
+ * API; merge hunk counts are small (a handful to a few dozen per file), so this is not a
+ * hot path worth optimizing. */
+export function hunkRangeAtIndex(decorations: DecorationSet, index: number): { from: number; to: number } | null {
+  let found: { from: number; to: number } | null = null;
+  decorations.between(0, Infinity, (from, to, deco) => {
+    const raw = (deco.spec.attributes as Record<string, string> | undefined)?.[HUNK_INDEX_ATTR];
+    if (raw !== undefined && Number(raw) === index) found = { from, to };
+  });
+  return found;
+}
+
+/**
+ * Builds the CM6 `{from, to, insert}` change to replace one hunk's current content with
+ * `newText` -- the resolution-action click's counterpart to `buildHunkCopyChange` (M2's
+ * copy-between-panes change builder). `hunkRangeAtIndex`'s range follows `posAfterLine`'s
+ * existing convention of extending through the line's trailing newline (see
+ * `buildHunkCopyChange`'s own tests), so `newText` needs its own trailing `\n` appended to match
+ * -- except when the range reaches the end of the document (the last line has no newline after
+ * it to replace), where appending one would introduce a newline that was never there. Returns
+ * `null` if the hunk has no current decoration (see `hunkRangeAtIndex`).
+ */
+export function buildHunkResolutionChange(decorations: DecorationSet, doc: Text, hunkIndex: number, newText: string): { from: number; to: number; insert: string } | null {
+  const range = hunkRangeAtIndex(decorations, hunkIndex);
+  if (!range) return null;
+  const atDocEnd = range.to >= doc.length;
+  const insert = atDocEnd ? newText : `${newText}\n`;
+  return { from: range.from, to: range.to, insert };
+}
+
+/**
+ * Restyles one hunk's decoration in place after its `resolution`/`kind` changes, at whatever
+ * position `RangeSet.map` has already carried it to -- CM6's own position-mapping correctly
+ * *stretches* a mark decoration to cover a full-range replacement (confirmed empirically: a
+ * transaction replacing an entire decorated range with different-length text yields one mapped
+ * decoration spanning the new content, not a zero-length or dropped one), but does NOT update
+ * the decoration's own `spec` (class/attributes) -- those are immutable per-decoration data, so a
+ * hunk whose resolution just changed needs its *decoration object* swapped for a freshly-styled
+ * one at the same range, while every other hunk's decoration is left completely alone. This is
+ * cheaper than a full `buildMergeHunkDecorations` rebuild and, more importantly, doesn't need
+ * every other hunk's *current* range recomputed (which nothing tracks outside this same
+ * `DecorationSet` once the merged pane has been edited even once -- see `initialMergedHunkRanges`'s
+ * doc comment on why it's only valid at open).
+ */
+export function replaceHunkDecoration(decorations: DecorationSet, hunkIndex: number, updatedHunk: MergeHunk): DecorationSet {
+  const range = hunkRangeAtIndex(decorations, hunkIndex);
+  if (!range) return decorations;
+  const filtered = decorations.update({ filter: (_from, _to, deco) => (deco.spec.attributes as Record<string, string> | undefined)?.[HUNK_INDEX_ATTR] !== String(hunkIndex) });
+  const restyled = Decoration.mark({
+    class: `merge-hunk merge-hunk-${updatedHunk.kind}${updatedHunk.resolution ? ` merge-hunk-resolved-${updatedHunk.resolution}` : ""}`,
+    attributes: { [HUNK_INDEX_ATTR]: String(hunkIndex) },
+  });
+  return filtered.update({ add: [restyled.range(range.from, range.to)] });
+}
+
 /** Replaces the whole `DecorationSet` -- used only at merge-view open (the initial seed) and
  * after a resolution change/manual edit changes which hunks exist or how they're classified.
  * Every other transaction (a plain keystroke that doesn't touch a hunk boundary) needs no
@@ -186,12 +246,14 @@ export function createMergeSourceEditor(parent: HTMLElement, text: string, hunks
   return new EditorView({ state, parent });
 }
 
-/** The editable merged-output pane, seeded from `OpenMergeResult.mergedText`. `onEdit` fires for
- * every real keystroke or programmatic replace (a resolution-action click's own dispatch) alike
- * -- the caller is responsible for calling `mark_merge_hunk_manual` only for the former, since a
- * resolution click already sets a non-Manual resolution via `resolve_merge_hunk` before
- * dispatching its own change. */
-export function createMergedEditor(parent: HTMLElement, mergedText: string, initialDecorations: DecorationSet, onEdit: (deltas: EditDelta[]) => void): EditorView {
+/** The editable merged-output pane, seeded from `OpenMergeResult.mergedText`. `initialRanges`
+ * (from `initialMergedHunkRanges`) and `hunks` build the initial `DecorationSet` internally, the
+ * same convention `createMergeSourceEditor` uses -- callers never construct a CM6 `Text`/
+ * `DecorationSet` themselves. `onEdit` fires for every real keystroke or programmatic replace (a
+ * resolution-action click's own dispatch) alike -- the caller is responsible for calling
+ * `mark_merge_hunk_manual` only for the former, since a resolution click already sets a
+ * non-Manual resolution via `resolve_merge_hunk` before dispatching its own change. */
+export function createMergedEditor(parent: HTMLElement, mergedText: string, initialRanges: LineRange[], hunks: MergeHunk[], onEdit: (deltas: EditDelta[]) => void): EditorView {
   const doc = Text.of(mergedText.split("\n"));
   const state = EditorState.create({
     doc,
@@ -199,7 +261,7 @@ export function createMergedEditor(parent: HTMLElement, mergedText: string, init
       lineNumbers(),
       keymap.of(defaultKeymap),
       javascript(),
-      mergeHunkDecorationsField.init(() => initialDecorations),
+      mergeHunkDecorationsField.init(() => buildMergeHunkDecorations(doc, initialRanges, hunks)),
       EditorView.updateListener.of((update: ViewUpdate) => {
         if (!update.docChanged) return;
         onEdit(editDeltasFromUpdate(update));

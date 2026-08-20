@@ -772,3 +772,43 @@ edit is the reverse (frontend's own edit already happened via `apply_merge_edit`
 `mark_merge_hunk_manual` just flips that hunk's resolution flag with no text computation at all,
 since the CM6 buffer already has the real content). Collapsing these into one command would force
 either path to fake data the other doesn't have.
+
+## 2026-08-20 — M5 merge view: full frontend wiring, and a real methodology lesson from a false-positive bug hunt
+
+**Decision**: `src/routes/merge/+page.svelte` is the M5 three-way merge view -- launched via
+`diffgrid --merge BASE LOCAL REMOTE`, redirected to from the main window's route (`goto("/merge")`
+in `+page.svelte`'s `onMount`, since Tauri's main window always starts at `/` with no `url`
+override) rather than opened as a second Tauri window like `settings/`. Four CM6 panes
+(`createMergeSourceEditor` ×3 read-only, `createMergedEditor` ×1 editable), click-to-select a
+hunk, four resolution-action buttons dispatching `resolve_merge_hunk` and splicing the returned
+text into the merged pane's live document via `buildHunkResolutionChange` +
+`replaceHunkDecoration`, a Save button calling `save_merge` and surfacing its resolved-vs-not
+result in the status line.
+
+**A false-positive bug hunt worth recording as its own lesson**: visually inspecting a screenshot
+after the first "Take remote" click, a resolved hunk's highlight appeared to be missing --
+looking like a real regression in the exact-boundary-replace case for `RangeSet.map` (a
+plausible-sounding CM6 gotcha: non-inclusive mark decorations are documented to sometimes not
+survive a change touching both their boundaries). Spent real effort chasing this as a suspected
+bug: wrote a manual Node reproduction script, found what looked like confirmation (a decoration
+appearing to vanish), and was about to add an `inclusive: true` fix. That reproduction had a
+transcription error (a hand-counted end offset off by one from the decoration's real boundary),
+which meant it was never testing the real code path at all. Rebuilding the repro using the
+actual computed range showed the decoration survives correctly with no special-casing needed.
+A follow-up debug trace inside the real running app (temporary `report_error` calls logging exact
+decoration ranges) confirmed the production code was correct the whole time; the visual
+"missing highlight" was the `#e0f0ff`/`#ffe0e0` colors simply being too low-contrast to read
+confidently against white at normal screenshot compression, not a functional bug.
+
+**Why this is worth recording, not just fixing quietly**: the instinct to trust a first plausible
+repro over re-deriving the inputs from the actual code is exactly the failure mode this project's
+own verification discipline exists to catch -- the fix here wasn't a code change, it was
+re-deriving the test's own inputs correctly before trusting its output. The actual, real
+consequence of the investigation was a legitimate one anyway: the low-contrast highlight colors
+were a genuine (if minor) usability finding, worth fixing regardless of whether a position-
+tracking bug existed (`#bfe0ff`/`#ffc9c9`/`#ffe49c`, darkened for real readability).
+
+**How to apply**: when a manual/scratch reproduction script "confirms" a suspected bug, re-derive
+its inputs from the same code the real system uses (call the real range-computing function,
+don't hand-count offsets) before trusting the result enough to write a fix -- a repro that
+reproduces the *belief* rather than the *system* will confirm anything.
