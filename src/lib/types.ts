@@ -92,4 +92,7 @@ export interface MergeHunk {
 export interface OpenMergeResult {
   hunks: MergeHunk[];
   mergedText: string;
+  baseText: string;
+  localText: string;
+  remoteText: string;
 }

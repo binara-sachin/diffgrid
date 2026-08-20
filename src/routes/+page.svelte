@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
+  import { goto } from "$app/navigation";
   import { invoke, Channel } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { Text } from "@codemirror/state";
@@ -493,6 +494,15 @@
     try {
       settings = await invoke<Settings>("load_settings");
       const args = await invoke<string[]>("launch_args");
+      if (args.includes("--merge")) {
+        // M5's three-way merge entry point (`diffgrid --merge BASE LOCAL REMOTE`) is its own
+        // route, not another mode of this already-large file -- see docs/PLAN.md §5's `merge/`
+        // module boundary. This window always starts at `/` (tauri.conf.json's window config has
+        // no `url` override), so a merge launch redirects here rather than the merge route ever
+        // being loaded directly; `/merge`'s own onMount re-fetches launch_args itself.
+        await goto("/merge");
+        return;
+      }
       if (args.length === 2) {
         const [leftKind, rightKind] = await Promise.all([
           invoke<string>("path_kind", { path: args[0] }),

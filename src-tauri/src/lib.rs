@@ -180,6 +180,9 @@ struct MergeState {
 struct OpenMergeResult {
     hunks: Vec<merge_core::MergeHunk>,
     merged_text: String,
+    base_text: String,
+    local_text: String,
+    remote_text: String,
 }
 
 /// Pure over already-read bytes, same split as `diff_pair`/`open_file_pair`. `local`'s `FileMeta`
@@ -198,14 +201,21 @@ fn open_merge_pair(base_bytes: &[u8], local_bytes: &[u8], remote_bytes: &[u8], t
     let hunks = merge_core::compute_merge_hunks(&base.normalized, &local.normalized, &remote.normalized);
     let merged_text = merge_core::build_merged_text(&base.normalized, &local.normalized, &remote.normalized, &hunks, take_both_order);
 
+    let result = OpenMergeResult {
+        hunks: hunks.clone(),
+        merged_text: merged_text.clone(),
+        base_text: base.normalized.clone(),
+        local_text: local.normalized.clone(),
+        remote_text: remote.normalized.clone(),
+    };
     let tab = MergeTab {
         base: base.normalized,
         local: local.normalized,
         remote: remote.normalized,
-        hunks: hunks.clone(),
+        hunks,
         merged: EditBuffer::new(&merged_text, local_bytes.to_vec(), local.meta),
     };
-    Ok((tab, OpenMergeResult { hunks, merged_text }))
+    Ok((tab, result))
 }
 
 /// Resolves one hunk (by index into `tab.hunks`) to a new value and returns the text the
@@ -626,6 +636,9 @@ mod tests {
         let (tab, result) = open_merge_pair(base, local, remote, merge_core::TakeBothOrder::LocalFirst).unwrap();
         assert_eq!(result.hunks.len(), 1);
         assert_eq!(result.merged_text, "a\nLOCAL\nc\n");
+        assert_eq!(result.base_text, "a\nb\nc\n");
+        assert_eq!(result.local_text, "a\nLOCAL\nc\n");
+        assert_eq!(result.remote_text, "a\nb\nc\n");
         assert_eq!(tab.merged.text(), "a\nLOCAL\nc\n");
         assert!(!tab.merged.is_dirty(), "seeding the merged buffer must not itself count as an edit");
     }

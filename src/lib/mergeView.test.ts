@@ -2,11 +2,14 @@ import { describe, expect, it } from "vitest";
 import { Text } from "@codemirror/state";
 import { EditorState } from "@codemirror/state";
 import {
+  buildHunkResolutionChange,
   buildMergeHunkDecorations,
   buildSourcePaneDecorations,
   hunkIndexAtPos,
+  hunkRangeAtIndex,
   initialMergedHunkRanges,
   mergeHunkDecorationsField,
+  replaceHunkDecoration,
   resolveHunkText,
   setMergeHunkDecorations,
 } from "./mergeView";
@@ -125,6 +128,92 @@ describe("buildSourcePaneDecorations", () => {
   });
 });
 
+describe("buildHunkResolutionChange", () => {
+  it("replaces the hunk's range including a trailing newline to match, when not at document end", () => {
+    const doc = Text.of("a\nLOCAL\nc\n".split("\n"));
+    const ranges = [{ start: 1, len: 1 }];
+    const hunks: MergeHunk[] = [hunk({ resolution: "takeRemote" })];
+    const decorations = buildMergeHunkDecorations(doc, ranges, hunks);
+    const change = buildHunkResolutionChange(decorations, doc, 0, "REPLACED")!;
+    expect(change).not.toBeNull();
+    const newDoc = doc.replace(change.from, change.to, Text.of([change.insert]));
+    expect(newDoc.toString()).toBe("a\nREPLACED\nc\n");
+  });
+
+  it("returns null for a hunk index with no current decoration", () => {
+    const doc = Text.of("a\nLOCAL\nc\n".split("\n"));
+    const decorations = buildMergeHunkDecorations(doc, [{ start: 1, len: 1 }], [hunk({ resolution: "takeLocal" })]);
+    expect(buildHunkResolutionChange(decorations, doc, 5, "X")).toBeNull();
+  });
+
+  it("does not append a trailing newline when the hunk reaches the end of the document", () => {
+    // No content after this hunk means posAfterLine's range ends exactly at doc.length (no
+    // newline to replace) -- appending "\n" here would introduce one that was never there.
+    const doc = Text.of("a\nLOCAL".split("\n"));
+    const ranges = [{ start: 1, len: 1 }];
+    const hunks: MergeHunk[] = [hunk({ resolution: "takeRemote" })];
+    const decorations = buildMergeHunkDecorations(doc, ranges, hunks);
+    const change = buildHunkResolutionChange(decorations, doc, 0, "REPLACED")!;
+    expect(change.insert).toBe("REPLACED");
+    const newDoc = doc.replace(change.from, change.to, Text.of([change.insert]));
+    expect(newDoc.toString()).toBe("a\nREPLACED");
+  });
+});
+
+describe("buildMergeHunkDecorations survives an exact-boundary replace", () => {
+  it("keeps hunk 0's decoration when a resolution shrinks its content and another hunk follows", () => {
+    // Pins the exact-boundary-replace case for RangeSet.map: a resolution click replaces a
+    // hunk's entire current range (both `from` and `to` matching the decoration's own
+    // boundaries exactly) with shorter text. Confirmed (via a temporary debug trace under Xvfb,
+    // after an initial hand-miscounted manual repro wrongly suggested this dropped the mark) that
+    // CM6's default mark decoration DOES survive an exact-boundary replace as long as the
+    // replacement is non-empty -- this test locks that behavior in rather than leaving it as an
+    // unverified assumption the rest of this module's resolution-splice logic depends on.
+    const doc = Text.of("line1\nLOCAL-CHANGE\nline3\nline4\nREMOTE-CHANGE\n".split("\n"));
+    const hunks: MergeHunk[] = [
+      hunk({ base: { start: 1, len: 1 }, local: { start: 1, len: 1 }, remote: { start: 1, len: 1 }, resolution: "takeLocal" }),
+      hunk({ base: { start: 4, len: 1 }, local: { start: 4, len: 1 }, remote: { start: 4, len: 1 }, resolution: "takeRemote" }),
+    ];
+    const ranges = [
+      { start: 1, len: 1 },
+      { start: 4, len: 1 },
+    ];
+    const decorations = buildMergeHunkDecorations(doc, ranges, hunks);
+    const range0 = hunkRangeAtIndex(decorations, 0)!;
+
+    const state = EditorState.create({ doc });
+    const changeSet = state.changes({ from: range0.from, to: range0.to, insert: "line2\n" });
+    const mapped = decorations.map(changeSet);
+
+    expect(hunkRangeAtIndex(mapped, 0)).not.toBeNull();
+    expect(hunkRangeAtIndex(mapped, 1)).not.toBeNull();
+  });
+});
+
+describe("replaceHunkDecoration", () => {
+  it("restyles one hunk's decoration in place, at its current (possibly-shifted) range, leaving other hunks untouched", () => {
+    const doc = Text.of("a\nCONFLICT\nc\nREMOTE\ne\n".split("\n"));
+    const ranges = [
+      { start: 1, len: 1 },
+      { start: 3, len: 1 },
+    ];
+    const hunks: MergeHunk[] = [hunk({ kind: "conflict", resolution: null }), hunk({ kind: "autoMerged", resolution: "takeRemote" })];
+    const decorations = buildMergeHunkDecorations(doc, ranges, hunks);
+    const resolvedHunk: MergeHunk = { ...hunks[0], resolution: "takeLocal" };
+    const updated = replaceHunkDecoration(decorations, 0, resolvedHunk);
+
+    // Hunk 0's class reflects the new resolution.
+    let hunk0Class: string | undefined;
+    updated.between(0, doc.length, (from, to, deco) => {
+      if ((deco.spec.attributes as Record<string, string>)?.["data-merge-hunk-index"] === "0") hunk0Class = deco.spec.class;
+    });
+    expect(hunk0Class).toContain("merge-hunk-resolved-takeLocal");
+
+    // Hunk 1 is untouched -- still findable at its original position with its original class.
+    expect(hunkIndexAtPos(updated, posAfterLine(doc, 3))).toBe(1);
+  });
+});
+
 describe("buildMergeHunkDecorations + hunkIndexAtPos", () => {
   it("marks each hunk's character range and hunkIndexAtPos finds it back by index", () => {
     const doc = Text.of("a\nLOCAL\nc\n".split("\n"));
@@ -179,6 +268,28 @@ describe("buildMergeHunkDecorations + hunkIndexAtPos", () => {
     const newDoc = state.doc;
     const hunk1PosAfter = posAfterLine(newDoc, 5); // "REMOTE" is now on line 6 (0-indexed 5), was line 4 (0-indexed 3)
     expect(hunkIndexAtPos(decorationsAfter, hunk1PosAfter)).toBe(1);
+  });
+
+  it("hunkRangeAtIndex finds a hunk's current character range by index", () => {
+    const doc = Text.of("a\nLOCAL\nc\nREMOTE\ne\n".split("\n"));
+    const ranges = [
+      { start: 1, len: 1 },
+      { start: 3, len: 1 },
+    ];
+    const hunks: MergeHunk[] = [hunk({ resolution: "takeLocal" }), hunk({ resolution: "takeRemote" })];
+    const decorations = buildMergeHunkDecorations(doc, ranges, hunks);
+    const range = hunkRangeAtIndex(decorations, 1);
+    expect(range).not.toBeNull();
+    // Trailing "\n" included, same posAfterLine convention buildHunkCopyChange's own tests use
+    // (a replace range spans through to the next line's start).
+    expect(doc.sliceString(range!.from, range!.to)).toBe("REMOTE\n");
+  });
+
+  it("hunkRangeAtIndex returns null for a hunk index with no decoration (e.g. a skipped zero-length hunk)", () => {
+    const doc = Text.of("a\nLOCAL\nc\n".split("\n"));
+    const hunks: MergeHunk[] = [hunk({ resolution: "takeLocal" }), hunk({ base: { start: 0, len: 0 }, local: { start: 0, len: 0 }, resolution: "takeRemote" })];
+    const decorations = buildMergeHunkDecorations(doc, [{ start: 1, len: 1 }, { start: 1, len: 0 }], hunks);
+    expect(hunkRangeAtIndex(decorations, 1)).toBeNull();
   });
 
   it("setMergeHunkDecorations fully replaces the field's value", () => {
