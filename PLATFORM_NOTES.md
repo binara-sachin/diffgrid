@@ -208,3 +208,18 @@ and the dirty-guard `window.confirm()` on closing an edited tab rendered as a re
 dialog under this GPU-less sandbox (unlike the earlier WebKitGTK `title`-tooltip finding above) —
 clicking Cancel correctly kept the tab open with its edit intact. No `report_error` calls appeared
 in the process log across the whole sequence.
+
+**`tauri::AppHandle::exit(code)` does not set a real non-zero process exit code, in this pinned
+Tauri version (2.11.5) at least -- verified as a genuine bug, not a Linux/WebKitGTK quirk.**
+M5's `git mergetool` exit-status contract needs the actual OS process exit code to reflect
+whether every merge conflict was resolved. `AppHandle::exit(1)` was measured under Xvfb to still
+exit the process with code 0, every time. Traced to the root cause in `tauri-runtime-wry`'s
+source: the exit code it's given is only ever forwarded to the app's `RunEvent::ExitRequested`
+callback for observation, never into `tao::event_loop::ControlFlow`'s actual exit-code-carrying
+variant -- `ControlFlow::Exit` (what gets set) is a hardcoded alias for `ExitWithCode(0)`. This is
+core Tauri/tao runtime plumbing, not anything WebKitGTK- or Linux-specific, so it should
+reproduce identically on macOS -- but re-verify there anyway before trusting it, since this
+entire finding rests on reading one specific pinned dependency version's source, not on a general
+claim about Tauri. The fix (`exit_process`'s Tauri command calling `std::process::exit(exit_code)`
+directly, bypassing the event loop's control-flow value entirely) is platform-independent and
+needs no further per-OS handling.

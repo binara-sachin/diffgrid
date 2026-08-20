@@ -812,3 +812,62 @@ tracking bug existed (`#bfe0ff`/`#ffc9c9`/`#ffe49c`, darkened for real readabili
 its inputs from the same code the real system uses (call the real range-computing function,
 don't hand-count offsets) before trusting the result enough to write a fix -- a repro that
 reproduces the *belief* rather than the *system* will confirm anything.
+
+## 2026-08-20 — M5 exit-status contract: two real bugs found only by testing the actual OS exit code, not just the frontend logic
+
+**Decision**: `diffgrid --merge BASE LOCAL REMOTE MERGED` now correctly writes to `$MERGED` (a
+path distinct from `$LOCAL`, per git's own mergetool convention -- confirmed by reading
+`/usr/lib/git-core/git-mergetool--lib` and `/usr/lib/git-core/mergetools/vimdiff` directly rather
+than assuming) and exits 0 only when every hunk is resolved, non-zero otherwise (Save with
+unresolved conflicts, or Abort). `exit_process` (the new Tauri command backing this) calls
+`std::process::exit(exit_code)` directly, not `tauri::AppHandle::exit(exit_code)`.
+
+**Real finding #1 -- git's own exit-code trust model**: read `git-mergetool--lib` directly rather
+than assuming "exit code" is the whole contract. A user-defined `mergetool.<name>.cmd` defaults to
+`trustExitCode = false` -- git's *default* behavior for a custom tool ignores the process exit
+code entirely and instead compares `$MERGED`'s mtime against a `touch`ed backup file taken before
+running the tool, prompting the user interactively if unchanged. The exit code only matters at
+all once the user explicitly sets `mergetool.diffgrid.trustExitCode = true`. This is why writing
+to the *real* `$MERGED` path (so its mtime updates) matters independently of getting the exit
+code right -- both halves of the contract are load-bearing for different configurations.
+
+**Real finding #2, a genuine shipped bug caught only by checking the actual saved bytes on
+disk**: `open_merge_pair` originally seeded the merged `EditBuffer` with `EditBuffer::new(&merged_text,
+local_bytes.to_vec(), local.meta)` -- passing LOCAL's raw file bytes as the buffer's "original
+bytes." `EditBuffer::to_bytes()` short-circuits to those original bytes whenever the buffer isn't
+dirty (by design, documented on `EditBuffer` itself, correct for an unedited two-way diff pane) --
+and the merged buffer is *never* dirty immediately after seeding, since seeding isn't an edit. The
+result: `save_merge` silently wrote LOCAL's raw content instead of the actual merged text for any
+tab where they differ, with no error anywhere. The existing open-time test
+(`open_merge_pair_computes_hunks_and_seeds_the_merged_buffer`) never caught this because its
+fixture happened to auto-merge to a result identical to LOCAL, and it only asserted against
+`tab.merged.text()` (which reads the rope directly and was always correct) rather than
+`to_bytes()` (what `save_merge` actually calls). Fixed by re-encoding `merged_text` through
+`text_io::to_bytes(&merged_text, &local.meta)` and passing *that* as `EditBuffer::new`'s original
+bytes. Caught by manually verifying the actual bytes written to disk under Xvfb, not by trusting
+the frontend's own (correct) view of the CM6 document -- the frontend's debug trace showed the
+right content the whole time, which is what pointed the investigation at the Rust save path.
+
+**Real finding #3, a platform limitation in Tauri 2.11.5 itself**: `tauri::AppHandle::exit(code)`
+does not actually set the process's OS-level exit code for any non-zero value. Traced through
+`tauri-runtime-wry`'s `Message::RequestExit(code)` handler: it forwards `code` to the
+`RunEvent::ExitRequested` callback (for observation/`prevent_exit()` only) but sets
+`*control_flow = ControlFlow::Exit`, and `tao::event_loop::ControlFlow::Exit` is a hardcoded
+alias for `ControlFlow::ExitWithCode(0)` -- the `code` value is never threaded into the actual
+control-flow variant that determines the event loop's (and thus the process's) real exit status.
+Confirmed by reading `tao`'s own source (`ControlFlow::Exit` is defined as
+`Self::ExitWithCode(0)`) and by direct empirical testing under Xvfb: `AppHandle::exit(1)`
+measurably, reproducibly still exits the process with code 0. `App::run_return()` (which returns
+the intended `i32` and whose own doc comment shows `std::process::exit(exit_code)` as the
+required follow-up) suffers the identical problem, since it goes through the same
+`ControlFlow::Exit` path. The only mechanism that actually works is calling
+`std::process::exit(exit_code)` directly, bypassing the event loop's control-flow value entirely
+-- which is what `exit_process` does. `App::run()`/`Builder::run()` (the normal window-close path
+for every other mode of this app) is untouched and still exits 0 as before, since nothing else
+calls `exit_process`.
+
+**How to apply**: if a future feature needs a non-zero exit code from a Tauri command again,
+route it through `std::process::exit` directly rather than `AppHandle::exit`/`App::restart` --
+verify this against a newer Tauri version before assuming it's fixed upstream, since this was
+traced against the exact pinned version (`tauri = "2"`, resolved to 2.11.5) in this workspace's
+`Cargo.lock`, not a general claim about Tauri.

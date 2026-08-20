@@ -208,12 +208,20 @@ fn open_merge_pair(base_bytes: &[u8], local_bytes: &[u8], remote_bytes: &[u8], t
         local_text: local.normalized.clone(),
         remote_text: remote.normalized.clone(),
     };
+    // `EditBuffer::to_bytes()` short-circuits to its "original bytes" when the buffer isn't
+    // dirty (see EditBuffer's own doc comment) -- correct for an unedited two-way diff pane,
+    // but the merged buffer is never dirty right after seeding (seeding is not an edit), so its
+    // "original bytes" must be the *actual merged text* re-encoded, not LOCAL's raw file bytes.
+    // Getting this wrong is silent: to_bytes() never errors, it just returns the wrong content,
+    // and it was only caught because a test specifically exercised to_bytes() rather than only
+    // checking `merged.text()` (which reads the rope directly and was correct all along).
+    let merged_bytes = text_io::to_bytes(&merged_text, &local.meta)?;
     let tab = MergeTab {
         base: base.normalized,
         local: local.normalized,
         remote: remote.normalized,
         hunks,
-        merged: EditBuffer::new(&merged_text, local_bytes.to_vec(), local.meta),
+        merged: EditBuffer::new(&merged_text, merged_bytes, local.meta),
     };
     Ok((tab, result))
 }
@@ -315,21 +323,49 @@ fn apply_merge_edit(state: tauri::State<MergeState>, tab_id: String, from_utf16:
     apply_merge_edit_impl(&state, &tab_id, from_utf16, to_utf16, &inserted)
 }
 
-/// Writes the merged buffer's current text back to `path` (LOCAL's original path, per
-/// `git mergetool`'s MERGED-starts-as-LOCAL convention already noted on `open_merge_pair`).
-/// Returns whether every hunk has a resolution other than `None` (i.e. no hunk is still an
-/// unresolved `Conflict`) -- task #42's write-back-with-correct-exit-status needs this to decide
-/// whether the CLI process should exit 0 or non-zero, which `save_merge` itself has no business
-/// deciding (it only knows how to write bytes; the exit-status *policy* belongs at the CLI/vcs
-/// layer, same module-boundary reasoning as everywhere else in this codebase).
-#[tauri::command]
-fn save_merge(state: tauri::State<MergeState>, tab_id: String, path: String) -> Result<bool, String> {
+/// Writes the merged buffer's current text back to `path` -- the caller passes git's `$MERGED`
+/// path (a distinct file from `$LOCAL`, per git's own mergetool convention; see
+/// `docs/UI`/DECISIONS.md's M5 entries). Returns whether every hunk has a resolution other than
+/// `None` (i.e. no hunk is still an unresolved `Conflict`) -- the CLI entry point needs this to
+/// decide whether the process should exit 0 or non-zero, which `save_merge` itself has no
+/// business deciding (it only knows how to write bytes; the exit-status *policy* belongs at the
+/// CLI/vcs layer, same module-boundary reasoning as everywhere else in this codebase).
+fn save_merge_impl(state: &MergeState, tab_id: &str, path: &str) -> Result<bool, String> {
     let mut tabs = state.tabs.lock().unwrap();
-    let tab = tabs.get_mut(&tab_id).ok_or("no merge tab open with this id")?;
+    let tab = tabs.get_mut(tab_id).ok_or("no merge tab open with this id")?;
     let bytes = tab.merged.to_bytes()?;
-    std::fs::write(&path, &bytes).map_err(|e| format!("{path}: {e}"))?;
+    std::fs::write(path, &bytes).map_err(|e| format!("{path}: {e}"))?;
     tab.merged.mark_saved(bytes);
     Ok(tab.hunks.iter().all(|h| h.resolution.is_some()))
+}
+
+#[tauri::command]
+fn save_merge(state: tauri::State<MergeState>, tab_id: String, path: String) -> Result<bool, String> {
+    save_merge_impl(&state, &tab_id, &path)
+}
+
+/// Terminates the process with `exit_code`, per docs/PLAN.md M5's "write-back with correct exit
+/// status" requirement -- `git mergetool` (when `mergetool.<name>.trustExitCode` is configured
+/// `true`) reads this to decide whether the merge succeeded, in place of its default fallback of
+/// checking whether `$MERGED`'s mtime changed. The frontend is the one deciding *which* code
+/// (0 for "every hunk resolved and saved," non-zero otherwise) -- this command is purely the
+/// mechanism, not the policy, matching `save_merge`'s own resolved-boolean return value being
+/// interpreted by the caller rather than baked in here.
+///
+/// Calls `std::process::exit` directly rather than `AppHandle::exit(exit_code)` -- verified
+/// under Xvfb that the latter does NOT work for a non-zero code in this Tauri version (2.11.5):
+/// `tauri-runtime-wry`'s `RequestExit(code)` handler sets `ControlFlow::Exit`, which `tao`
+/// defines as a hardcoded alias for `ControlFlow::ExitWithCode(0)` -- the `code` argument is only
+/// ever forwarded to the `RunEvent::ExitRequested` callback for observation/prevention, never
+/// into the control-flow value that actually determines the event loop's (and thus
+/// `run_return`'s, and thus the process's) real exit code. `AppHandle::exit` would silently
+/// always exit 0 no matter what was requested, which is worse than a visible failure for a
+/// contract (`git mergetool`'s `trustExitCode`) whose entire point is a truthful non-zero on
+/// failure -- calling `std::process::exit` ourselves sidesteps the event loop's control-flow
+/// value entirely, so this limitation doesn't matter.
+#[tauri::command]
+fn exit_process(exit_code: i32) {
+    std::process::exit(exit_code);
 }
 
 /// Companion to `open_file_pair`: the normalized (BOM-stripped, LF-normalized) full text of
@@ -644,6 +680,25 @@ mod tests {
     }
 
     #[test]
+    fn open_merge_pair_seeds_the_merged_buffer_with_the_actual_merged_text_not_locals_raw_bytes() {
+        // Regression test for a real bug: EditBuffer::to_bytes() short-circuits to its
+        // "original bytes" when not dirty (by design, for an unedited two-way diff pane -- see
+        // EditBuffer's own doc comment). The merged buffer is *never* dirty right after open
+        // (seeding it is not an edit), so if its "original bytes" were ever local_bytes instead
+        // of the actual merged text, to_bytes() would silently return LOCAL's raw content for
+        // any hunk whose resolution happens to differ from local -- exactly the save_merge path.
+        // Base and local disagree with remote on line 2, so the merged placeholder (base
+        // content, since this is an unresolved Conflict) must differ from local's raw bytes for
+        // this test to actually distinguish the bug from the fix.
+        let base = b"a\nb\nc\n";
+        let local = b"a\nLOCAL\nc\n";
+        let remote = b"a\nREMOTE\nc\n";
+        let (tab, result) = open_merge_pair(base, local, remote, merge_core::TakeBothOrder::LocalFirst).unwrap();
+        assert_eq!(result.merged_text, "a\nb\nc\n", "unresolved conflict placeholder is base content");
+        assert_eq!(tab.merged.to_bytes().unwrap(), b"a\nb\nc\n", "to_bytes() must return the actual merged content, not local's raw bytes, even though the buffer was never edited");
+    }
+
+    #[test]
     fn open_merge_pair_refuses_when_any_side_is_binary() {
         let result = open_merge_pair(b"a\n", b"hello\0world", b"a\n", merge_core::TakeBothOrder::LocalFirst);
         match result {
@@ -683,6 +738,72 @@ mod tests {
         let result = resolve_merge_hunk_impl(&mut tab, 0, merge_core::Resolution::Manual, merge_core::TakeBothOrder::LocalFirst);
         assert!(result.is_err(), "Manual must go through mark_merge_hunk_manual, not this command");
         assert_eq!(tab.hunks[0].resolution, None, "a rejected call must not mutate hunk state");
+    }
+
+    fn merge_state_with_tab(tab_id: &str, base: &[u8], local: &[u8], remote: &[u8]) -> MergeState {
+        let (tab, _) = open_merge_pair(base, local, remote, merge_core::TakeBothOrder::LocalFirst).unwrap();
+        let state = MergeState::default();
+        state.tabs.lock().unwrap().insert(tab_id.to_string(), tab);
+        state
+    }
+
+    #[test]
+    fn save_merge_writes_to_the_given_path_which_may_differ_from_local_or_remote() {
+        // Per git's own mergetool convention, MERGED is a distinct path from LOCAL/REMOTE (often
+        // a temp file) -- this pins that save_merge writes wherever it's told, not to a
+        // hardcoded side's original path.
+        let dir = std::env::temp_dir().join(format!("diffgrid-test-{}-save-merge-path", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let merged_path = dir.join("MERGED_TMP");
+        let state = merge_state_with_tab("m1", b"a\nb\nc\n", b"a\nLOCAL\nc\n", b"a\nb\nc\n");
+        save_merge_impl(&state, "m1", merged_path.to_str().unwrap()).unwrap();
+        assert_eq!(std::fs::read_to_string(&merged_path).unwrap(), "a\nLOCAL\nc\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_merge_returns_true_when_every_hunk_is_resolved() {
+        let dir = std::env::temp_dir().join(format!("diffgrid-test-{}-save-merge-resolved", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out");
+        // Local-only change auto-resolves to TakeLocal at open -- no conflict here.
+        let state = merge_state_with_tab("m1", b"a\nb\nc\n", b"a\nLOCAL\nc\n", b"a\nb\nc\n");
+        let all_resolved = save_merge_impl(&state, "m1", path.to_str().unwrap()).unwrap();
+        assert!(all_resolved);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_merge_returns_false_when_a_conflict_is_still_unresolved() {
+        let dir = std::env::temp_dir().join(format!("diffgrid-test-{}-save-merge-unresolved", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out");
+        let state = merge_state_with_tab("m1", b"a\nb\nc\n", b"a\nLOCAL\nc\n", b"a\nREMOTE\nc\n");
+        let all_resolved = save_merge_impl(&state, "m1", path.to_str().unwrap()).unwrap();
+        assert!(!all_resolved, "a genuine conflict with no resolution yet must report false");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_merge_returns_true_after_a_conflict_is_resolved() {
+        let dir = std::env::temp_dir().join(format!("diffgrid-test-{}-save-merge-then-resolved", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out");
+        let state = merge_state_with_tab("m1", b"a\nb\nc\n", b"a\nLOCAL\nc\n", b"a\nREMOTE\nc\n");
+        {
+            let mut tabs = state.tabs.lock().unwrap();
+            let tab = tabs.get_mut("m1").unwrap();
+            resolve_merge_hunk_impl(tab, 0, merge_core::Resolution::TakeLocal, merge_core::TakeBothOrder::LocalFirst).unwrap();
+        }
+        let all_resolved = save_merge_impl(&state, "m1", path.to_str().unwrap()).unwrap();
+        assert!(all_resolved);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_merge_errors_on_an_unknown_tab_id_instead_of_panicking() {
+        let state = MergeState::default();
+        assert!(save_merge_impl(&state, "does-not-exist", "/tmp/whatever").is_err());
     }
 
     #[test]
@@ -957,7 +1078,7 @@ pub fn run() {
             open_file_pair, open_file_text, launch_args, intra_line_spans, apply_edit, redo_diff,
             save_file, path_kind, scan_dirs, cancel_scan, close_tab, load_settings, save_settings,
             open_settings_window, open_merge, resolve_merge_hunk, mark_merge_hunk_manual,
-            close_merge_tab, apply_merge_edit, save_merge
+            close_merge_tab, apply_merge_edit, save_merge, exit_process
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
