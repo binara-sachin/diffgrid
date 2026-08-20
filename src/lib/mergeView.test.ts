@@ -292,6 +292,24 @@ describe("buildMergeHunkDecorations + hunkIndexAtPos", () => {
     expect(hunkRangeAtIndex(decorations, 1)).toBeNull();
   });
 
+  it("does not skip a zero-length range for an unresolved conflict hunk -- it still needs a trackable position for a later resolution click (e.g. an add/add conflict with an empty BASE)", () => {
+    const doc = Text.of("a\nb\n".split("\n"));
+    const hunks: MergeHunk[] = [hunk({ base: { start: 1, len: 0 }, local: { start: 1, len: 1 }, remote: { start: 1, len: 1 }, resolution: null, kind: "conflict" })];
+    const decorations = buildMergeHunkDecorations(doc, [{ start: 1, len: 0 }], hunks);
+    expect(hunkRangeAtIndex(decorations, 0)).not.toBeNull();
+  });
+
+  it("buildHunkResolutionChange inserts real text at a zero-length unresolved-conflict hunk's position, instead of silently no-op'ing (regression: Take Local/Remote/Both/Base on an add/add conflict wrote nothing)", () => {
+    const doc = Text.of("a\nb\n".split("\n"));
+    const ranges = [{ start: 1, len: 0 }];
+    const hunks: MergeHunk[] = [hunk({ resolution: null, kind: "conflict" })];
+    const decorations = buildMergeHunkDecorations(doc, ranges, hunks);
+    const change = buildHunkResolutionChange(decorations, doc, 0, "RESOLVED")!;
+    expect(change).not.toBeNull();
+    const newDoc = doc.replace(change.from, change.to, Text.of([change.insert]));
+    expect(newDoc.toString()).toBe("a\nRESOLVED\nb\n");
+  });
+
   it("setMergeHunkDecorations fully replaces the field's value", () => {
     const doc = Text.of("a\nLOCAL\nc\n".split("\n"));
     const hunks: MergeHunk[] = [hunk({ resolution: "takeLocal" })];
