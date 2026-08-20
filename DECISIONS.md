@@ -923,3 +923,21 @@ zero-byte-BASE realities that caught both findings above. And: a hunk needing a 
 action should never be treated the same as a hunk that is *already* permanently resolved, even
 when they produce the same zero-length range today -- the two need different position-tracking
 lifetimes even though `buildMergeHunkDecorations` sees them as structurally identical input.
+
+## 2026-08-20 — `git difftool -t diffgrid` already works today, no new code needed
+
+**Decision**: while updating README.md for M5 completion and scoping M6, checked (rather than
+assumed) whether `git difftool` integration was actually still missing, since PLAN.md's M6 entry
+groups "`difftool`/`mergetool` argument-convention edge cases" together. Read
+`/usr/lib/git-core/git-difftool--helper` directly: `git difftool` invokes the configured tool with
+exactly `$LOCAL $REMOTE` (two positional args, no `$BASE`/`$MERGED`) -- precisely M1's existing
+`diffgrid FILE1 FILE2` entry point (`src/routes/+page.svelte`'s `args.length === 2` branch).
+Verified live under Xvfb: `git config difftool.diffgrid.cmd '.../app "$LOCAL" "$REMOTE"'` then
+`git difftool -t diffgrid` opened the real two-way diff view, correctly diffing the worktree file
+against the pre-edit blob git staged into a temp path -- no app code changed, config only.
+
+**How to apply**: `git difftool` needs no dedicated M6 implementation work, only documentation
+(now in README.md) and, eventually, inclusion in whatever `difftool`/`mergetool` edge-case test
+suite M6 builds (multi-file invocations, `--dir-diff`, renamed/deleted files, etc. are still
+unverified). Don't let "the milestone doc groups X and Y together" imply X and Y are equally
+unstarted -- check each independently before scoping the work left to do.

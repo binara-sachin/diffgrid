@@ -5,17 +5,28 @@ architecture, module boundaries, and milestone breakdown. `docs/M0-RESULTS.md` /
 `docs/PROFILING.md` cover the feasibility spike and the performance investigation that fixed the
 scroll/paint regression found there (now shipped — see the `perf:` commit in `git log`).
 
-**Status: M4 complete** — one unified session window (`diffgrid FILE1 FILE2` or
-`diffgrid DIR1 DIR2`) wrapping M1-M3 in multi-tab form, plus persisted global preferences. Files:
-encoding/line-ending/binary detection, histogram line diff, lazy intra-line highlighting (off /
-word-level / character-level, global setting), live per-tab whitespace/case-ignore toggles,
-collapsed unchanged regions (context-line count configurable), hunk navigation, a minimap overview
-strip, both panes editable with debounced live re-diff, per-side save
-(encoding/line-ending-preserving), and per-hunk apply/revert. Directories: recursive
-gitignore-aware cancellable scan, tiered size/mtime/content compare, a real collapsible/expandable
-sidebar tree (not a flat table) with a hide-identical toggle, clicking a file opens it as a tab in
-the same window. Multiple file pairs can be open as tabs simultaneously, each with independent
-edit/dirty state; a settings window (gear icon) persists global preferences across launches.
+**Status: M5 complete** — one unified session window (`diffgrid FILE1 FILE2` or
+`diffgrid DIR1 DIR2`) wrapping M1-M3 in multi-tab form, plus persisted global preferences, plus a
+real three-way merge tool usable as `git mergetool -t diffgrid`. Files: encoding/line-ending/binary
+detection, histogram line diff, lazy intra-line highlighting (off / word-level / character-level,
+global setting), live per-tab whitespace/case-ignore toggles, collapsed unchanged regions
+(context-line count configurable), hunk navigation, a minimap overview strip, both panes editable
+with debounced live re-diff, per-side save (encoding/line-ending-preserving), and per-hunk
+apply/revert. Directories: recursive gitignore-aware cancellable scan, tiered size/mtime/content
+compare, a real collapsible/expandable sidebar tree (not a flat table) with a hide-identical
+toggle, clicking a file opens it as a tab in the same window. Multiple file pairs can be open as
+tabs simultaneously, each with independent edit/dirty state; a settings window (gear icon)
+persists global preferences across launches. Merge: `diffgrid --merge BASE LOCAL REMOTE [MERGED]`
+opens a 4-pane BASE/LOCAL/REMOTE/MERGED view, auto-resolves non-conflicting hunks, offers Take
+Local/Remote/Both/Base plus direct manual editing of the merged result, and writes back to
+`$MERGED` with a real process exit code (0 iff every hunk is resolved) — verified end-to-end
+through a real `git mergetool -t diffgrid` invocation, not just direct invocation of the binary.
+`git difftool -t diffgrid` also already works today, unmodified — confirmed via a real invocation,
+not assumed.
+
+M6 (git-integration hardening, packaging, full quality bar) is next: no `tauri-plugin-single-instance`
+is wired up yet, no codesign/notarize, no bundler packaging config, and macOS has not yet been
+verified at all (everything above has only run on Linux/WebKitGTK/Xvfb so far).
 
 Stack: Rust core (histogram diff via `imara-diff`) + Tauri shell + CodeMirror 6 frontend.
 
@@ -67,8 +78,9 @@ npm run tauri dev
 ## Run
 
 ```bash
-target/release/app FILE1 FILE2   # two-way file diff
-target/release/app DIR1 DIR2     # directory comparison
+target/release/app FILE1 FILE2                          # two-way file diff
+target/release/app DIR1 DIR2                            # directory comparison
+target/release/app --merge BASE LOCAL REMOTE MERGED     # three-way merge
 ```
 
 **Files**: opens a real two-way diff — encoding/line-ending detection, histogram line diff, lazy
@@ -93,8 +105,27 @@ persisted to disk (`app_config_dir()/settings.json`) and applied live to newly-o
 tab's own whitespace/case-ignore toggles seed from the global default but are a per-tab override
 that never writes back.
 
-There's no file picker yet — launch args (or `git difftool`/`mergetool`, M6) are the only way to
-open a session.
+**Merge**: `diffgrid --merge BASE LOCAL REMOTE [MERGED]` opens a 4-pane view (BASE/LOCAL/REMOTE
+read-only source panes, plus an editable MERGED pane seeded with the auto-merge result). Hunks
+that only changed on one side auto-resolve; real conflicts are highlighted and need a decision —
+click a hunk (in any pane) then Take Local/Remote/Both/Base, or edit the MERGED pane directly.
+`MERGED` defaults to `LOCAL` when omitted (convenient for manual testing; a real `git mergetool`
+invocation always passes all four). Save writes the merged text to `MERGED` and exits 0 only if
+every hunk is resolved (non-zero otherwise, or on Abort) — set this up as a real git mergetool
+with:
+
+```bash
+git config --global mergetool.diffgrid.cmd '/path/to/target/release/app --merge "$BASE" "$LOCAL" "$REMOTE" "$MERGED"'
+git config --global mergetool.diffgrid.trustExitCode true   # otherwise git falls back to an mtime check + interactive prompt
+git mergetool -t diffgrid
+```
+
+There's no file picker yet — launch args (or `git difftool`/`git mergetool`) are the only way to
+open a session. `git difftool -t diffgrid` already works today (git invokes the same `FILE1 FILE2`
+form as plain two-way diff, `$LOCAL`/`$REMOTE`, no app changes needed) — configure it the same way
+as `mergetool` above, just with `difftool.diffgrid.cmd` and no `$BASE`/`$MERGED`. Hardening the
+`difftool`/`mergetool` argument-convention edge cases (and the single-instance trap noted below) is
+M6 scope.
 
 Running the binary with **no arguments** instead launches the M0 benchmark flow: it loads the
 100k-line synthetic fixture, renders the dual-pane diff, then runs a self-contained
