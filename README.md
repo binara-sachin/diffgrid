@@ -24,9 +24,16 @@ through a real `git mergetool -t diffgrid` invocation, not just direct invocatio
 `git difftool -t diffgrid` also already works today, unmodified — confirmed via a real invocation,
 not assumed.
 
-M6 (git-integration hardening, packaging, full quality bar) is next: no `tauri-plugin-single-instance`
-is wired up yet, no codesign/notarize, no bundler packaging config, and macOS has not yet been
-verified at all (everything above has only run on Linux/WebKitGTK/Xvfb so far).
+M6 (git-integration hardening, packaging, full quality bar) is in progress. Decided not to add
+`tauri-plugin-single-instance` (no launch path needs it yet — see DECISIONS.md). All of the
+`difftool`/`mergetool` argument-convention edge cases PLAN.md calls out are verified working with
+no code changes needed: multi-file `git difftool`, `git difftool --dir-diff` (maps straight to
+M3's directory view), a renamed+modified file in a merge (git's rename detection resolves before
+the tool is invoked), and delete/symlink conflicts (git handles these itself via its own
+interactive prompt, never invoking the external tool at all) — see DECISIONS.md for how each was
+verified. Still open: no codesign/notarize, no bundler packaging config, the remaining PLAN.md §7
+benchmark targets aren't wired up, and macOS has not yet been verified at all (everything above
+has only run on Linux/WebKitGTK/Xvfb so far).
 
 Stack: Rust core (histogram diff via `imara-diff`) + Tauri shell + CodeMirror 6 frontend.
 
