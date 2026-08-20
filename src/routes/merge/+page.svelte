@@ -15,15 +15,24 @@
   import type { EditDelta } from "$lib/diffView";
   import type { MergeHunk, OpenMergeResult, Resolution, Settings } from "$lib/types";
 
-  // M5's three-way merge view (docs/PLAN.md's BASE/LOCAL/REMOTE + merged-output view),
-  // launched via `diffgrid --merge BASE LOCAL REMOTE` and rendered as this window's whole
-  // content -- not a secondary window like settings/, since `git mergetool` invokes one process
-  // per conflict and the merge view *is* that process's job, not an auxiliary feature of a
-  // session doing something else.
+  // M5's three-way merge view (docs/PLAN.md's BASE/LOCAL/REMOTE + merged-output view), launched
+  // via `diffgrid --merge BASE LOCAL REMOTE MERGED` (matching git's own mergetool positional
+  // convention -- see e.g. /usr/lib/git-core/mergetools/vimdiff's own comment: a configured
+  // `mergetool.<name>.cmd` is invoked with $BASE/$LOCAL/$REMOTE/$MERGED substituted in that
+  // order) and rendered as this window's whole content -- not a secondary window like
+  // settings/, since `git mergetool` invokes one process per conflict and the merge view *is*
+  // that process's job, not an auxiliary feature of a session doing something else.
+  //
+  // MERGED is a genuinely distinct path from LOCAL (per git's convention MERGED often names a
+  // temp file, not the real working-tree file) -- Save must write there, not to LOCAL, or the
+  // real file git expects updated never gets touched. The 3-arg form (no MERGED) is kept as a
+  // convenience for manual testing/demoing outside a real git invocation, defaulting MERGED to
+  // LOCAL in that case only.
   let status = $state("loading…");
   let basePath = $state("");
   let localPath = $state("");
   let remotePath = $state("");
+  let mergedPath = $state("");
   const tabId = "merge-1";
 
   // Mirrors Rust's tab.hunks -- kept in sync after every resolution change so the toolbar's
@@ -55,10 +64,11 @@
     if (found !== null) selectedHunk = found;
   }
 
-  async function openMerge(base: string, local: string, remote: string) {
+  async function openMerge(base: string, local: string, remote: string, merged: string) {
     basePath = base;
     localPath = local;
     remotePath = remote;
+    mergedPath = merged;
     status = "merging…";
     settings = await invoke<Settings>("load_settings");
     const result = await invoke<OpenMergeResult>("open_merge", {
@@ -139,9 +149,25 @@
     status = statusLine();
   }
 
+  /**
+   * Writes the merged result to $MERGED and exits -- per `git mergetool`'s own contract (see
+   * this file's top-of-script comment), exit 0 only when every hunk actually has a resolution;
+   * a save with unresolved conflicts still writes the file (so the placeholder/partial content
+   * is visible for a later manual re-run) but exits non-zero, since git only trusts this
+   * process's exit code at all when the user has configured
+   * `mergetool.diffgrid.trustExitCode = true` -- silently exiting 0 with real conflicts left
+   * unresolved would make git record an incorrect "successful" merge for that configuration.
+   */
   async function saveMerge() {
-    const allResolved = await invoke<boolean>("save_merge", { tabId, path: localPath });
+    const allResolved = await invoke<boolean>("save_merge", { tabId, path: mergedPath });
     status = allResolved ? "saved — all conflicts resolved" : "saved — unresolved conflicts remain";
+    await invoke("exit_process", { exitCode: allResolved ? 0 : 1 });
+  }
+
+  /** Quits without saving -- an aborted merge, per `git mergetool`'s convention that a non-zero
+   * exit (again, only trusted under `trustExitCode = true`) means the merge did not succeed. */
+  async function abortMerge() {
+    await invoke("exit_process", { exitCode: 1 });
   }
 
   onMount(async () => {
@@ -149,10 +175,16 @@
     window.addEventListener("unhandledrejection", (e) => invoke("report_error", { message: `merge unhandledrejection: ${String(e.reason)}` }));
     const args = await invoke<string[]>("launch_args");
     const mergeIndex = args.indexOf("--merge");
-    if (mergeIndex !== -1 && args.length >= mergeIndex + 4) {
-      await openMerge(args[mergeIndex + 1], args[mergeIndex + 2], args[mergeIndex + 3]);
+    if (mergeIndex !== -1 && args.length >= mergeIndex + 3) {
+      const base = args[mergeIndex + 1];
+      const local = args[mergeIndex + 2];
+      const remote = args[mergeIndex + 3];
+      // MERGED (a 4th, distinct path per git's own convention) defaults to LOCAL only for the
+      // 3-arg manual-testing convenience form -- see this file's top-of-script comment.
+      const merged = args.length >= mergeIndex + 5 ? args[mergeIndex + 4] : local;
+      await openMerge(base, local, remote, merged);
     } else {
-      status = "no --merge BASE LOCAL REMOTE arguments given";
+      status = "no --merge BASE LOCAL REMOTE [MERGED] arguments given";
     }
   });
 </script>
@@ -160,7 +192,10 @@
 <main>
   <div class="status">
     <span>{status}</span>
-    <button onclick={saveMerge}>Save</button>
+    <div class="status-actions">
+      <button onclick={abortMerge}>Abort</button>
+      <button onclick={saveMerge}>Save</button>
+    </div>
   </div>
   <div class="sources">
     <div class="pane">
@@ -202,6 +237,10 @@
     font-size: 12px;
     background: #222;
     color: #eee;
+  }
+  .status-actions {
+    display: flex;
+    gap: 6px;
   }
   .sources {
     display: flex;
