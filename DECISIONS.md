@@ -941,3 +941,27 @@ against the pre-edit blob git staged into a temp path -- no app code changed, co
 suite M6 builds (multi-file invocations, `--dir-diff`, renamed/deleted files, etc. are still
 unverified). Don't let "the milestone doc groups X and Y together" imply X and Y are equally
 unstarted -- check each independently before scoping the work left to do.
+
+## 2026-08-20 — M6: not adding `tauri-plugin-single-instance` (no launch path needs it yet)
+
+**Decision**: PLAN.md's M6 entry flags "the single-instance trap" as something to design around
+*if* a single-instance plugin is used for normal launches -- it was never a firm requirement, just
+a risk to resolve before adopting one. Checked what actually drives that need in diffgrid today:
+every launch is either a bare CLI invocation (`diffgrid FILE1 FILE2` / `DIR1 DIR2` / `--merge ...`)
+or a `git difftool`/`mergetool` spawn -- there is no Dock-icon double-click flow, no Finder "Open
+With" file association, no OS-level "reuse the existing window" affordance anywhere in the app yet
+(no file picker either, per the M4/M5 README notes). Without one of those launch paths, single-
+instance behavior has no actual use case to serve, only a trap to introduce.
+
+**Decision**: do not add `tauri-plugin-single-instance`. Each invocation stays an independent
+process/window, exactly what M0-M5 already built, tested, and shipped against (including this
+session's real `git mergetool` verification). No code change needed -- this closes out that M6
+line item as "consciously not done," not "still to do."
+
+**How to apply**: revisit only if a future milestone adds a genuine GUI launch path (Dock icon,
+file-type association, "open in existing window" menu item) that would create duplicate-window
+churn without it. If that day comes, the fix is one of the two PLAN.md already named: exempt CLI
+tool-mode invocations (bare file args, `--merge`, anything git spawns) from single-instance
+entirely, or make the forwarding process block on the real window's close event and forward its
+actual exit code -- never let a second `git mergetool`/`difftool` invocation silently forward-and-
+exit-0 without a window ever opening for it.
