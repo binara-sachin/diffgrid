@@ -871,3 +871,55 @@ route it through `std::process::exit` directly rather than `AppHandle::exit`/`Ap
 verify this against a newer Tauri version before assuming it's fixed upstream, since this was
 traced against the exact pinned version (`tauri = "2"`, resolved to 2.11.5) in this workspace's
 `Cargo.lock`, not a general claim about Tauri.
+
+## 2026-08-20 — M5 demo criterion actually exercised through real `git mergetool`, catching two things a direct-binary-invocation test can't
+
+**Decision**: closed the gap between the previous session's exit-status verification (invoked the
+built binary directly with 4 hand-typed args) and the M5 milestone's own stated demo criterion
+("demoable via `git mergetool -t diffgrid` on a real conflicted repo") by actually running it that
+way: a real git repo, a real 3-way conflict, `mergetool.diffgrid.cmd`/`trustExitCode` configured
+the way a real user would, launched under Xvfb with `xdotool` driving the clicks, `git status`
+read afterward as the ground truth rather than the app's own reported state. Confirmed both
+directions -- Save (fully resolved) exits 0 and git stages the correct content; Abort exits 1 and
+git leaves the conflict-marker file untouched -- and confirmed no `tauri-plugin-single-instance`
+is wired up, so the M6-flagged "second invocation forwards and exits 0" trap does not apply yet.
+
+**Real finding #1 -- the binary under test was stale**: `target/debug/app` predated the last
+commit to `src-tauri/src/lib.rs` by ~30 minutes. Every "exit code" observed against it (including
+an apparent Abort-always-exits-0 regression) was testing pre-fix code, not the fix. `cargo build`
+before trusting any exit-code observation from here on; a git-log-vs-binary-mtime check is now
+the first move before believing any binary-level result in this repo.
+
+**Real finding #2, a genuine bug caught only by driving the real add/add-conflict path (not
+something a synthetic content-conflict fixture exercises)**: an add/add conflict leaves `BASE`
+empty (git creates a zero-byte `_BASE_` temp file), so the unresolved `Conflict` hunk's
+first-paint placeholder in `merge-core`'s `build_merged_text`/`mergeView.ts`'s
+`initialMergedHunkRanges` is the empty string, giving that hunk a zero-length range in the merged
+pane. `buildMergeHunkDecorations` (`src/lib/mergeView.ts`) skipped creating *any* decoration for a
+zero-length range -- a deliberate, correct choice for a hunk that is *already resolved* to nothing
+(e.g. an empty `TakeBoth` side, the case its own test already covered), but wrong for a hunk that
+is *still unresolved* and will need a real position once the user picks Take Local/Remote/Both/
+Base. With no decoration, `hunkRangeAtIndex` returned `null`, so `+page.svelte`'s `resolveSelected`
+took its `if (change) {...}` no-op branch: it still marked the hunk's in-memory `resolution` as
+set (enabling Save, showing "all hunks resolved") but never dispatched a CM6 transaction, so the
+merged buffer's text never changed. Save then reported "all conflicts resolved," exited 0, and --
+under `trustExitCode = true` -- git staged the file exactly as it started: **empty**, silently
+discarding both sides' actual added content. Confirmed via the real repro (an add/add conflict
+through `git mergetool`) before writing a fix, not assumed from reading the code.
+
+**Fix**: `buildMergeHunkDecorations` now only skips a zero-length range when the hunk is *already*
+resolved (`resolution !== null`); an unresolved zero-length `Conflict` hunk still gets a
+zero-length `Decoration.mark` (confirmed empirically that CM6's `RangeSetBuilder`/`RangeSet`
+accept and correctly report a zero-length mark range via `.between()` -- this is not a CM6
+limitation, just an unused capability). Verified with two new `mergeView.test.ts` cases (TDD: both
+written and watched fail against the pre-fix code first) and, again, against the real add/add
+conflict through `git mergetool`: the correct side's text now lands in the merged buffer and gets
+staged, not an empty file.
+
+**How to apply**: any future "did the exit-status/write-back contract hold" verification for this
+feature should go through the real `git mergetool`/`git difftool` invocation, not a direct binary
+call with hand-typed args -- a direct call skips exactly the argument-convention and
+zero-byte-BASE realities that caught both findings above. And: a hunk needing a *future* user
+action should never be treated the same as a hunk that is *already* permanently resolved, even
+when they produce the same zero-length range today -- the two need different position-tracking
+lifetimes even though `buildMergeHunkDecorations` sees them as structurally identical input.

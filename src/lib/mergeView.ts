@@ -79,18 +79,30 @@ const HUNK_INDEX_ATTR = "data-merge-hunk-index";
  * through every edit, the same mechanism the two-way diff view's own decoration fields already
  * rely on for line-highlight ranges.
  *
- * A hunk with `len === 0` (a pure insertion resolved to nothing, e.g. an empty `TakeBoth` side)
- * is skipped -- CM6 can't usefully mark a zero-length range for click targeting, and there's
- * nothing to click on since it renders no visible lines.
+ * A hunk with `len === 0` that is already resolved (a pure insertion resolved to nothing, e.g.
+ * an empty `TakeBoth` side) is skipped -- CM6 can't usefully mark a zero-length range for click
+ * targeting, and there's nothing to click on since it renders no visible lines, and no future
+ * action will ever need this position again once a hunk is resolved.
+ *
+ * An *unresolved* `Conflict` hunk (`resolution === null`) whose placeholder happens to be
+ * zero-length (e.g. an add/add conflict where BASE is empty, so the first-paint placeholder --
+ * base's own content -- is "") is NOT skipped: CM6 supports a zero-length `Decoration.mark`
+ * range for tracking/click-targeting purposes even though it renders nothing (confirmed
+ * empirically), and this hunk still needs a trackable position for the Take Local/Remote/Both/
+ * Base click that will eventually insert real text there. Regression found by testing the M5
+ * exit-status contract through a real `git mergetool` add/add conflict: without this, a
+ * resolution click silently updated the frontend's own "resolved" bookkeeping without ever
+ * inserting text into the merged buffer (since `hunkRangeAtIndex` had nothing to find), so Save
+ * exited 0 and staged an empty file as the "resolved" merge result.
  */
 export function buildMergeHunkDecorations(doc: Text, ranges: LineRange[], hunks: MergeHunk[]): DecorationSet {
   const builder = new RangeSetBuilder<Decoration>();
   const entries = ranges.map((r, i) => ({ r, i })).sort((a, b) => a.r.start - b.r.start);
   for (const { r, i } of entries) {
-    if (r.len === 0) continue;
+    const hunk = hunks[i];
+    if (r.len === 0 && hunk.resolution !== null) continue;
     const from = posAfterLine(doc, r.start);
     const to = posAfterLine(doc, r.start + r.len);
-    const hunk = hunks[i];
     builder.add(
       from,
       to,
