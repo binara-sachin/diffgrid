@@ -57,6 +57,10 @@ export interface DirEntry {
   symlinkTarget: string | null;
   sizeLeft: number | null;
   sizeRight: number | null;
+  /** The real per-side absolute path -- open by this, not by joining a root with `path`, which
+   * is normalized for tree-building/dedup and may not match what's actually on disk. */
+  absLeft: string | null;
+  absRight: string | null;
 }
 
 export interface ScanOutcome {

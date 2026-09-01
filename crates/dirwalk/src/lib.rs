@@ -8,6 +8,7 @@ use std::time::SystemTime;
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use serde::Serialize;
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,9 +23,11 @@ pub enum EntryStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirEntry {
-    /// Forward-slash-normalized, relative to each root -- the join key between the two trees,
-    /// so it must be computed identically on both sides (see `relative_path`) or every entry
-    /// mismatches.
+    /// Forward-slash-normalized and NFC-normalized, relative to each root -- the join key
+    /// between the two trees, so it must be computed identically on both sides (see
+    /// `relative_path`) or every entry mismatches. Display/tree-building only -- NOT safe to
+    /// join onto a root and open, since it may not byte-for-byte match what's actually on disk
+    /// (see `abs_left`/`abs_right`).
     pub path: String,
     pub status: EntryStatus,
     pub is_dir: bool,
@@ -32,6 +35,12 @@ pub struct DirEntry {
     pub symlink_target: Option<String>,
     pub size_left: Option<u64>,
     pub size_right: Option<u64>,
+    /// The real, unnormalized absolute path on each side, `None` when that side has no entry
+    /// (`LeftOnly`/`RightOnly`). This is what a caller must open by -- not `path` -- because
+    /// `path` is normalized for joining and a byte-exact filesystem (ext4, unlike APFS) will
+    /// fail to look up a normalized form that doesn't match what's actually stored on disk.
+    pub abs_left: Option<String>,
+    pub abs_right: Option<String>,
 }
 
 /// User-facing exclude globs, per docs/PLAN.md's "glob/.gitignore filters." Plain glob syntax
@@ -109,12 +118,21 @@ fn walker(root: &Path, options: &ScanOptions) -> ignore::Walk {
 /// logical file into a LeftOnly/RightOnly pair instead of matching it.
 fn relative_path(root: &Path, path: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/")
+    // NFC-normalized: this is the left/right join key (see `DirEntry::path`'s doc comment), and
+    // filesystems disagree on whether they normalize filenames at all (APFS preserves whatever
+    // byte sequence was written; a name in NFC form on one side and NFD form on the other -- same
+    // visual name -- would otherwise join as two different keys). Safe to normalize even though
+    // it may not byte-for-byte match what's on disk: macOS's own path lookup is normalization-
+    // insensitive, so a caller opening a file by this path resolves correctly regardless.
+    rel.components().map(|c| c.as_os_str().to_string_lossy().nfc().collect::<String>()).collect::<Vec<_>>().join("/")
 }
 
 fn file_info(entry: &ignore::DirEntry) -> Option<FileInfo> {
     let is_symlink = entry.path_is_symlink();
-    let symlink_target = if is_symlink { fs::read_link(entry.path()).ok().map(|t| t.to_string_lossy().into_owned()) } else { None };
+    // NFC-normalized for the same reason `relative_path` is: `symlink_target` is only ever
+    // displayed or compared between sides (`classify`), never used to actually resolve/open the
+    // link (this scanner never follows symlinks), so there's no ENOENT risk here unlike `path`.
+    let symlink_target = if is_symlink { fs::read_link(entry.path()).ok().map(|t| t.to_string_lossy().nfc().collect::<String>()) } else { None };
     // A symlink's own metadata (not the target's) is what determines is_dir here -- consistent
     // with never following links, so a symlink is always treated as its own leaf kind, never as
     // "the file/dir it points to."
@@ -257,6 +275,8 @@ pub fn scan(left_root: &Path, right_root: &Path, options: &ScanOptions, cancel: 
                 symlink_target: right_info.symlink_target.clone(),
                 size_left: left_info.size,
                 size_right: right_info.size,
+                abs_left: Some(left_info.abs_path.to_string_lossy().into_owned()),
+                abs_right: Some(right_info.abs_path.to_string_lossy().into_owned()),
             },
             None => DirEntry {
                 path: rel,
@@ -266,6 +286,8 @@ pub fn scan(left_root: &Path, right_root: &Path, options: &ScanOptions, cancel: 
                 symlink_target: right_info.symlink_target.clone(),
                 size_left: None,
                 size_right: right_info.size,
+                abs_left: None,
+                abs_right: Some(right_info.abs_path.to_string_lossy().into_owned()),
             },
         };
         batch.push(dir_entry);
@@ -295,6 +317,8 @@ pub fn scan(left_root: &Path, right_root: &Path, options: &ScanOptions, cancel: 
             symlink_target: info.symlink_target,
             size_left: info.size,
             size_right: None,
+            abs_left: Some(info.abs_path.to_string_lossy().into_owned()),
+            abs_right: None,
         })
         .collect();
     while !leftover.is_empty() {
@@ -353,6 +377,8 @@ mod tests {
             symlink_target: None,
             size_left: Some(1),
             size_right: Some(2),
+            abs_left: Some("/left/a".into()),
+            abs_right: Some("/right/a".into()),
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["status"], "modified");
@@ -361,6 +387,8 @@ mod tests {
         assert_eq!(json["symlinkTarget"], serde_json::Value::Null);
         assert_eq!(json["sizeLeft"], 1);
         assert_eq!(json["sizeRight"], 2);
+        assert_eq!(json["absLeft"], "/left/a");
+        assert_eq!(json["absRight"], "/right/a");
     }
 
     #[test]
@@ -396,6 +424,32 @@ mod tests {
         fs::File::open(right.join("f.txt")).unwrap().set_modified(now).unwrap();
         let (entries, _) = scan_all(&left, &right, &ScanOptions::default());
         assert_eq!(find(&entries, "f.txt").status, EntryStatus::Same, "documented tradeoff: same size+mtime short-circuits to Same");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn apfs_nfc_and_nfd_forms_of_the_same_filename_join_as_one_entry() {
+        // Real, reproducible bug confirmed on live APFS (see PLATFORM_NOTES.md): APFS preserves
+        // whatever byte sequence a filename is written with -- it does NOT normalize like HFS+
+        // did -- so writing the same visual name in NFC form on one side and NFD form on the
+        // other produces genuinely different path bytes on disk. `relative_path` must normalize
+        // before using the path as the left/right join key, or this reports as spurious
+        // LeftOnly+RightOnly instead of Modified.
+        let (left, right) = test_dirs("apfs-nfd-join");
+        let nfc = "caf\u{e9}.txt"; // precomposed é (U+00E9)
+        let nfd = "cafe\u{301}.txt"; // e + combining acute accent (U+0301)
+        write(&left, nfc, "left content");
+        write(&right, nfd, "right content");
+        let (entries, _) = scan_all(&left, &right, &ScanOptions::default());
+        assert_eq!(entries.len(), 1, "NFC and NFD forms of the same filename should join as one entry: {entries:#?}");
+        assert_eq!(entries[0].status, EntryStatus::Modified);
+        // The join key (`path`) is normalized and may not match either side's real on-disk
+        // bytes -- `abs_left`/`abs_right` must still be the real, actually-openable path for
+        // each side, or a byte-exact filesystem (unlike APFS) would fail to open them.
+        let left_path = entries[0].abs_left.as_ref().expect("abs_left set for a Modified entry");
+        let right_path = entries[0].abs_right.as_ref().expect("abs_right set for a Modified entry");
+        assert_eq!(fs::read_to_string(left_path).unwrap(), "left content");
+        assert_eq!(fs::read_to_string(right_path).unwrap(), "right content");
     }
 
     #[test]

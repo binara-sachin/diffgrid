@@ -691,8 +691,11 @@
    * the same pair, which is never what a user wants from a tabbed UI.
    */
   async function openRowAsFilePair(entry: DirEntry) {
-    const left = `${dirLeftRoot}/${entry.path}`;
-    const right = `${dirRightRoot}/${entry.path}`;
+    // `entry.absLeft`/`absRight` are the real on-disk paths; `entry.path` is normalized for
+    // tree-building/dedup and can mismatch what's actually on disk (see dirwalk's DirEntry
+    // doc comment) -- falling back to it only covers a `DirEntry` that predates this field.
+    const left = entry.absLeft ?? `${dirLeftRoot}/${entry.path}`;
+    const right = entry.absRight ?? `${dirRightRoot}/${entry.path}`;
     const existing = tabs.find((t) => t.leftPath === left && t.rightPath === right);
     if (existing) {
       activeTabId = existing.id;
@@ -746,7 +749,7 @@
                   class="status-{row.entry?.status ?? 'same'}"
                   class:openable={isOpenable(row.entry)}
                   class:folder={row.isDir}
-                  class:selected={isOpenable(row.entry) && activeTab?.leftPath === `${dirLeftRoot}/${row.path}` && activeTab?.rightPath === `${dirRightRoot}/${row.path}`}
+                  class:selected={isOpenable(row.entry) && activeTab?.leftPath === (row.entry?.absLeft ?? `${dirLeftRoot}/${row.path}`) && activeTab?.rightPath === (row.entry?.absRight ?? `${dirRightRoot}/${row.path}`)}
                   onclick={() => onDirTreeRowClick(row)}
                 >
                   <td class="tree-indent" style="width: {row.depth * 14}px"></td>

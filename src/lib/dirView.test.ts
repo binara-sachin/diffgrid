@@ -3,7 +3,7 @@ import { buildDirTree, countDirTreeFiles, flattenDirTree, pruneDirTree, visibleD
 import type { DirEntry } from "./types";
 
 function entry(path: string, status: DirEntry["status"] = "same", isDir = false): DirEntry {
-  return { path, status, isDir, isSymlink: false, symlinkTarget: null, sizeLeft: 1, sizeRight: 1 };
+  return { path, status, isDir, isSymlink: false, symlinkTarget: null, sizeLeft: 1, sizeRight: 1, absLeft: `/left/${path}`, absRight: `/right/${path}` };
 }
 
 describe("buildDirTree", () => {
