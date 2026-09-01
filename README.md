@@ -31,9 +31,24 @@ no code changes needed: multi-file `git difftool`, `git difftool --dir-diff` (ma
 M3's directory view), a renamed+modified file in a merge (git's rename detection resolves before
 the tool is invoked), and delete/symlink conflicts (git handles these itself via its own
 interactive prompt, never invoking the external tool at all) — see DECISIONS.md for how each was
-verified. Still open: no codesign/notarize, no bundler packaging config, the remaining PLAN.md §7
-benchmark targets aren't wired up, and macOS has not yet been verified at all (everything above
-has only run on Linux/WebKitGTK/Xvfb so far).
+verified. Five of PLAN.md §7's six benchmark rows are now wired up: `bench/m0-spike.mjs` (cold
+launch, 100k-line scroll fps), `bench/open-file-bench.mjs` (10k-line real file-pair open-to-paint,
+*and* idle memory @ 10k lines — the row `m0-spike.mjs`'s 100k-fixture flow was never actually
+measuring, PLATFORM_NOTES.md flagged this explicitly), a real `≤1s` assertion for the 50k-file
+first-rows target (`cargo test -p dirwalk --release -- --ignored`), and `cargo bench -p diff-core
+-p dirwalk` for algorithmic regressions independent of the UI. Still not wired up: §7's "60fps
+floor, scroll + resize" row's resize-simulation variant (only the scroll half exists).
+
+Real macOS verification is underway (first session on the actual arm64 target — everything before
+this had only run on Linux/WebKitGTK/Xvfb): cold launch, scroll fps, idle memory, the custom-
+protocol release build, and the bench harness's `ps` parsing are all confirmed working; a real
+cross-platform correctness bug (APFS filenames in NFC vs. NFD form joining as spurious
+`LeftOnly`+`RightOnly` instead of `Modified`) was found and fixed. Still open: no codesign/
+notarize, no bundler packaging config, and a handful of PLATFORM_NOTES.md items that need
+interactive GUI driving (real keyboard shortcuts, line-height measurement against real WKWebView/
+Menlo rendering, a `git mergetool` GUI walkthrough for the exit-code contract) rather than
+CLI/filesystem probing — see PLATFORM_NOTES.md and DECISIONS.md for the full detail on all of the
+above.
 
 Stack: Rust core (histogram diff via `imara-diff`) + Tauri shell + CodeMirror 6 frontend.
 
@@ -167,6 +182,29 @@ run; always read the memory number together with that line, never alone.
 Linux benchmark numbers in this repo's history were recorded in a sandboxed, GPU-less
 environment with WebKitGTK — not representative of the macOS target. See `docs/M0-RESULTS.md`
 and `PLATFORM_NOTES.md` before drawing conclusions from them.
+
+```bash
+node fixtures/gen/gen-line-pair.mjs 10000 fixtures/10k-line-pair 7   # if not already generated
+node bench/open-file-bench.mjs 5
+```
+
+Measures two docs/PLAN.md §7 targets the M0 spike flow above doesn't actually cover, both against
+a real file pair (`diffgrid FILE1 FILE2`), separately from `m0-spike.mjs`'s own numbers: 10k-line
+first-render (open-command-dispatch-to-painted latency, target ≤300ms), and idle memory sampled
+~5s after paint (target ≤300MB) — `m0-spike.mjs`'s no-args flow always loads the 100k fixture, so
+its idle-memory number was never actually measured against the 10k-line target PLAN.md names.
+Shares its process-spawn/cleanup plumbing with `m0-spike.mjs` via `bench/lib/harness.mjs`.
+
+```bash
+node fixtures/gen/gen-file-tree.mjs 50000 fixtures/50k-file-tree 7   # if not already generated
+cargo test -p dirwalk --release -- --ignored --nocapture first_batch_of_the_50k
+cargo bench -p diff-core -p dirwalk
+```
+
+The 50k-file scan asserts docs/PLAN.md §7's ≤1s first-rows target (must run `--release`; a debug
+build's overhead alone can approach the budget at this scale). The criterion benches track
+`diff_lines`/`scan` algorithmic regressions independent of the UI, entirely synthetic-input (no
+fixture generation needed).
 
 ## Project layout
 
