@@ -327,6 +327,11 @@
    * future second entry point.
    */
   async function mountFileTab(id: string, left: string, right: string) {
+    // docs/PLAN.md §7's "10k-line first render ≤300ms" is defined as "open-command dispatch →
+    // post-decoration requestAnimationFrame" -- exactly this span, same instrumentation shape as
+    // runSpike's M0 paintMs. Reported via the same `report_bench` command/marker line an external
+    // harness (bench/open-file-bench.mjs) already knows how to wait for.
+    const t0 = performance.now();
     status = "diffing…";
     const [result, leftBuf, rightBuf] = await Promise.all([
       invoke<OpenPairResult>("open_file_pair", { tabId: id, left, right }),
@@ -405,6 +410,10 @@
     tab.diffStats = result.diff.stats;
     leftView.scrollDOM.addEventListener("scroll", () => updateViewportIndicatorFor(id));
     updateViewportIndicatorFor(id);
+
+    await doubleRaf();
+    const paintMs = performance.now() - t0;
+    await invoke("report_bench", { json: JSON.stringify({ mode: "open_file_pair", paintMs }) });
 
     status = "ready";
     await invoke("report_ready");
