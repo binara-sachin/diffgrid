@@ -646,14 +646,16 @@ mod tests {
     }
 
     /// Not part of the regular suite (`#[ignore]`d, and skips instead of failing when the
-    /// gitignored fixture hasn't been generated) -- measures whether the two-phase design's
-    /// "walk left fully before any row can stream" cost risks the ≤1s first-rows target from
-    /// docs/PLAN.md §7 at the scale that target is written against. Run explicitly with:
+    /// gitignored fixture hasn't been generated) -- asserts docs/PLAN.md §7's "50k-file tree,
+    /// first rows ≤1s" target at the scale it's written against, including the two-phase
+    /// design's "walk left fully before any row can stream" cost DECISIONS.md flagged as a risk.
+    /// Debug-build overhead alone can approach the 1s budget on a walk this size, so this must
+    /// be run with `--release` to measure what the target is actually about -- run explicitly:
     /// `cargo test -p dirwalk --release -- --ignored --nocapture measure_scan_timing`
     /// after generating the fixture: `node fixtures/gen/gen-file-tree.mjs 50000 fixtures/50k-file-tree 7`
     #[test]
     #[ignore]
-    fn measure_scan_timing_against_the_50k_fixture() {
+    fn first_batch_of_the_50k_fixture_scan_arrives_within_one_second() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/50k-file-tree");
         let (left, right) = (root.join("left"), root.join("right"));
         if !left.is_dir() || !right.is_dir() {
@@ -673,5 +675,7 @@ mod tests {
             "first batch at {:?}, total scan {:?}, left_visited={}, right_visited={}, entries_emitted={}",
             first_batch_at, total, outcome.left_visited, outcome.right_visited, outcome.entries_emitted
         );
+        let first_batch_at = first_batch_at.expect("scan emitted no batches at all -- fixture too small or scan is broken");
+        assert!(first_batch_at <= std::time::Duration::from_secs(1), "first batch took {first_batch_at:?}, over the ≤1s docs/PLAN.md §7 target");
     }
 }
