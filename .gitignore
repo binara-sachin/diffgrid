@@ -25,6 +25,9 @@ src-tauri/gen
 /fixtures/10k-line-pair
 /fixtures/50k-file-tree
 
+# Editor
+.vscode/
+
 # Claude Code
 .claude/
 docs/
