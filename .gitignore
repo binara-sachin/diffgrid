@@ -30,3 +30,5 @@ src-tauri/gen
 docs/
 .mcp.local.json
 CLAUDE.local.md
+DECISIONS.md
+PLATFORM_NOTES.md
