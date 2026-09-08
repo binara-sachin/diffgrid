@@ -27,5 +27,6 @@ src-tauri/gen
 
 # Claude Code
 .claude/
+docs/
 .mcp.local.json
 CLAUDE.local.md
