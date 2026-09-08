@@ -1,16 +1,31 @@
+# OS
 .DS_Store
+
+# Node
 node_modules
+
+# SvelteKit
 /build
 /.svelte-kit
 /package
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Rust / Tauri
+/target
+src-tauri/gen
+
+# Environment
 .env
 .env.*
 !.env.example
-vite.config.js.timestamp-*
-vite.config.ts.timestamp-*
-/target
-src-tauri/gen
+
+# Benchmark fixtures
 /fixtures/100k-line-pair
 /fixtures/10k-line-pair
 /fixtures/50k-file-tree
 
+# Claude Code
+.claude/
+.mcp.local.json
+CLAUDE.local.md
