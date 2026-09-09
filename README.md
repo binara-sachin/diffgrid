@@ -4,9 +4,8 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#prerequisites)
 [![Built with Tauri](https://img.shields.io/badge/built%20with-Tauri-24C8DB)](https://tauri.app)
 
-A fast, native diff and merge tool for files and directories — a from-scratch
-alternative to Meld, built with a Rust core and a CodeMirror 6 frontend. Drop
-it in as your `git difftool`/`git mergetool` and it just works.
+A fast, native diff and merge tool for files and directories, built with a Rust core and a CodeMirror 6 frontend. 
+Drop it in as your `git difftool`/`git mergetool` and it just works.
 
 ## Features
 
